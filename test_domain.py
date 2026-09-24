@@ -15,6 +15,8 @@ from domain import (
     ROLE_GUARD,
     ROLE_REVIEWER,
     ROLE_ENTERPRISE,
+    ROLE_PROCESSOR,
+    ROLE_REGULATOR,
     ValidationFailed,
 )
 
@@ -570,6 +572,409 @@ class TraceabilityTest(unittest.TestCase):
         self.assertEqual(chain["加工入口"]["制品"], "陈皮")
         self.assertEqual(chain["交货单"]["交货单编号"], did)
         self.assertEqual(chain["地块"]["地块编号"], w.plot_id)
+
+
+class RecallWorld(World):
+    """在基础世界上再注册加工方/监管，并搭出 在库40/在途30/成品20 的分流链路。"""
+
+    def __init__(self):
+        super().__init__()
+        self.svc.register_actor("proc", "陈皮加工厂", ROLE_PROCESSOR)
+        self.svc.register_actor("reg", "监管员郑直", ROLE_REGULATOR)
+        self.proc = self.svc.authenticate("proc")
+        self.reg = self.svc.authenticate("reg")
+        # 第二家企业，用于跨企业隔离
+        self.svc.register_actor("ent2", "别家饮料厂", ROLE_ENTERPRISE)
+        self.ent2 = self.svc.authenticate("ent2")
+        # 第二家加工方，用于跨加工方隔离
+        self.svc.register_actor("proc2", "别家加工厂", ROLE_PROCESSOR)
+        self.proc2 = self.svc.authenticate("proc2")
+
+        self.batch = self.svc.open_batch(self.coop, self.plot_id, "2026-09-01", "2026秋")
+        self.bid = self.batch["批次编号"]
+        self.ticket, self.insp = weigh_inspect_settle(
+            self, self.bid, self.old_tree_id, "RC1", "100", "A")
+        self.did = self.svc.deliver(
+            self.coop, self.bid, "广兴饮料厂", self.contract_id,
+            "2026-09-02T08:00:00+00:00")["交货单编号"]
+        self.sid = self.svc.settle(self.coop, self.did)["结算编号"]
+        # 60kg 发加工：30 仍在途，30 到厂投入
+        self.svc.ship_to_processing(self.ent, self.did, "60")
+        self.svc.arrive_at_processor(self.proc, self.did, "30")
+        pb = self.svc.create_processing_batch(
+            self.proc, "陈皮",
+            [{"交货单编号": self.did, "投入重量kg": "30"}],
+            [{"制品": "陈皮", "重量kg": "20"}])
+        self.pid = pb["加工批次"]["加工批次编号"]
+        self.gid = pb["成品"][0]["成品编号"]
+
+    def fail_pesticide(self):
+        return self.svc.pesticide_review(
+            self.reg, self.insp["检验编号"], "克百威", "不合格",
+            "0.05", "0.02", "送检实验室复测超标")["农残编号"]
+
+    def task_by(self, recall, **kw):
+        out = [t for t in recall["任务"]
+               if all(t.get(k) == v for k, v in kw.items())]
+        assert len(out) == 1, f"期望唯一任务，实际 {[(t.get('位置'), t.get('节点类型')) for t in recall['任务']]}"
+        return out[0]
+
+
+class PesticideReviewTest(unittest.TestCase):
+    def setUp(self):
+        self.w = RecallWorld()
+
+    def test_pesticide_review_keeps_original_inspection(self):
+        svc = self.w.svc
+        first = svc.pesticide_review(self.w.reviewer, self.w.insp["检验编号"],
+                                     "克百威", "合格", "0.01", "0.02", "首轮合格")
+        second = svc.pesticide_review(self.w.reg, self.w.insp["检验编号"],
+                                      "克百威", "不合格", "0.05", "0.02", "复测超标")
+        # 原始质量检验与其等级、封存样本不被改写
+        chain = svc.trace_from_product(self.w.ent, delivery_id=self.w.did)
+        current = chain["磅单与检测依据"][0]["现行检验"]
+        self.assertEqual(current["等级"], "A")
+        self.assertEqual(current["样本编号"], self.w.insp["样本编号"])
+        self.assertTrue(second["现行"])
+        self.assertFalse(svc._pesticide[first["农残编号"]].现行)
+        self.assertEqual(second["复核自"], first["农残编号"])
+        # 复测沿用同一封存样本
+        self.assertEqual(second["样本编号"], self.w.insp["样本编号"])
+
+    def test_only_failed_review_can_open_recall(self):
+        ok = self.w.svc.pesticide_review(
+            self.w.reg, self.w.insp["检验编号"], "克百威", "合格", "0.01", "0.02", "合格")
+        with self.assertRaises(Conflict) as cm:
+            self.w.svc.open_recall(self.w.reg, "过磅批次", self.w.bid, ok["农残编号"])
+        self.assertEqual(cm.exception.code, "pesticide_qualified")
+
+    def test_only_regulator_opens_recall(self):
+        prid = self.w.fail_pesticide()
+        with self.assertRaises(PermissionDenied):
+            self.w.svc.open_recall(self.w.ent, "过磅批次", self.w.bid, prid)
+
+
+class RecallExpansionTest(unittest.TestCase):
+    def setUp(self):
+        self.w = RecallWorld()
+        self.prid = self.w.fail_pesticide()
+
+    def test_recall_from_finished_goods_covers_only_goods(self):
+        r = self.w.svc.open_recall(self.w.reg, "成品", self.w.gid, self.prid)
+        self.assertEqual(len(r["任务"]), 1)
+        t = r["任务"][0]
+        self.assertEqual(t["节点类型"], "成品")
+        self.assertEqual(t["保管方"], "加工方")
+
+    def test_recall_from_batch_finds_each_current_custodian(self):
+        r = self.w.svc.open_recall(self.w.reg, "过磅批次", self.w.bid, self.prid)
+        positions = {(t["位置"], t["保管方"]): Decimal(t["任务重量kg"])
+                     for t in r["任务"]}
+        # 在库40（企业，系统已隔离）、在途30（承运）、成品20（加工方系统隔离）
+        self.assertEqual(positions[("在库", "企业")], Decimal("40"))
+        self.assertEqual(positions[("在途", "承运方")], Decimal("30"))
+        self.assertEqual(positions[("在库", "加工方")], Decimal("20"))
+        stock = self.w.task_by(r, 位置="在库", 保管方="企业")
+        transit = self.w.task_by(r, 位置="在途")
+        self.assertEqual(stock["状态"], "已隔离")
+        self.assertEqual(stock["隔离方式"], "系统")
+        self.assertEqual(transit["状态"], "待通知")
+
+    def test_recall_from_plot_covers_all_its_batches(self):
+        svc = self.w.svc
+        b2 = svc.open_batch(self.w.coop, self.w.plot_id, "2026-09-03", "2026秋")["批次编号"]
+        weigh_inspect_settle(self.w, b2, self.w.old_tree_id, "RC2", "10", "A")
+        svc.deliver(self.w.coop, b2, "广兴饮料厂", self.w.contract_id,
+                    "2026-09-04T08:00:00+00:00")
+        r = svc.open_recall(self.w.reg, "地块", self.w.plot_id, self.prid)
+        batches = {t["节点编号"] for t in r["任务"] if t["节点类型"] == "交货单"}
+        # 两个交货批次都被定位
+        self.assertEqual(len(batches), 2)
+
+
+class RecallDisposalTest(unittest.TestCase):
+    def setUp(self):
+        self.w = RecallWorld()
+        self.prid = self.w.fail_pesticide()
+        self.recall = self.w.svc.open_recall(
+            self.w.reg, "过磅批次", self.w.bid, self.prid)
+        self.rid = self.recall["召回编号"]
+
+    def test_duplicate_notify_has_one_effect(self):
+        svc = self.w.svc
+        transit = self.w.task_by(self.recall, 位置="在途")
+        first = svc.notify_task(self.w.ent, transit["任务编号"])
+        second = svc.notify_task(self.w.ent, transit["任务编号"], channel="短信")
+        self.assertFalse(first["幂等命中"])
+        self.assertTrue(second["幂等命中"])
+        self.assertEqual(second["通知"]["通知编号"], first["通知"]["通知编号"])
+        view = svc.get_recall(self.w.reg, self.rid)
+        self.assertEqual(len(view["通知"]), 1)
+
+    def test_offline_receipt_replay_is_idempotent(self):
+        svc = self.w.svc
+        transit = self.w.task_by(self.recall, 位置="在途")
+        svc.notify_task(self.w.ent, transit["任务编号"])
+        a = svc.disposal_receipt(self.w.ent, transit["任务编号"], "拦截",
+                                 "OFF-1", "30", offline=True)
+        b = svc.disposal_receipt(self.w.ent, transit["任务编号"], "拦截",
+                                 "OFF-1", "30", offline=True)
+        self.assertFalse(a["幂等命中"])
+        self.assertTrue(b["幂等命中"])
+        task = svc.get_recall(self.w.reg, self.rid)
+        self.assertEqual(self.w.task_by(task, 位置="在途")["隔离中kg"], "30")
+
+    def test_destroy_requires_prior_quarantine(self):
+        svc = self.w.svc
+        transit = self.w.task_by(self.recall, 位置="在途")
+        with self.assertRaises(Conflict) as cm:
+            svc.disposal_receipt(self.w.ent, transit["任务编号"], "销毁", "D1", "30")
+        self.assertEqual(cm.exception.code, "not_quarantined")
+
+    def test_non_custodian_cannot_dispose(self):
+        transit = self.w.task_by(self.recall, 位置="在途")
+        # 加工方不是在途原料的保管方
+        with self.assertRaises(PermissionDenied):
+            self.w.svc.notify_task(self.w.proc, transit["任务编号"])
+        # 别家企业也不能处置
+        with self.assertRaises(PermissionDenied):
+            self.w.svc.notify_task(self.w.ent2, transit["任务编号"])
+
+    def test_full_disposal_balances_and_closes(self):
+        svc = self.w.svc
+        stock = self.w.task_by(self.recall, 位置="在库", 保管方="企业")
+        transit = self.w.task_by(self.recall, 位置="在途")
+        goods = self.w.task_by(self.recall, 节点类型="成品")
+
+        svc.notify_task(self.w.ent, transit["任务编号"])
+        svc.disposal_receipt(self.w.ent, transit["任务编号"], "拦截", "T-1", "30")
+        svc.disposal_receipt(self.w.ent, transit["任务编号"], "销毁", "T-2", "30")
+        svc.disposal_receipt(self.w.ent, stock["任务编号"], "销毁", "S-1", "40")
+        svc.disposal_receipt(self.w.proc, goods["任务编号"], "销毁", "G-1", "20")
+
+        report = svc.recall_report(self.w.reg, self.rid)["结案报告"]
+        self.assertTrue(report["数量守恒"])
+        self.assertEqual(report["范围总重量kg"], "90")
+        self.assertEqual(report["去向"]["销毁kg"], "90")
+        self.assertEqual(report["未回执节点"], [])
+        closed = svc.close_recall(self.w.reg, self.rid)
+        self.assertEqual(closed["状态"], "已结案")
+        # 结案后冻结
+        with self.assertRaises(Conflict):
+            svc.notify_task(self.w.ent, transit["任务编号"])
+
+    def test_delivered_goods_substitute_delivery(self):
+        svc = self.w.svc
+        # 把既有成品标记为已交付客户：召回责任转由供货企业替代交付
+        svc._goods[self.w.gid].物流状态 = "已交付"
+        svc._goods[self.w.gid].保管方 = "企业"
+        r = svc.open_recall(self.w.reg, "成品", self.w.gid, self.prid)
+        t = r["任务"][0]
+        self.assertEqual(t["保管方"], "企业")
+        self.assertEqual(t["状态"], "待通知")
+        svc.notify_task(self.w.ent, t["任务编号"])
+        svc.disposal_receipt(self.w.ent, t["任务编号"], "替代交付", "SUB-1", "20")
+        report = svc.recall_report(self.w.reg, r["召回编号"])["结案报告"]
+        self.assertEqual(report["去向"]["替代交付kg"], "20")
+        self.assertTrue(report["数量守恒"])
+
+
+class RecallReshapeTest(unittest.TestCase):
+    def setUp(self):
+        self.w = RecallWorld()
+        self.prid = self.w.fail_pesticide()
+        self.recall = self.w.svc.open_recall(
+            self.w.reg, "过磅批次", self.w.bid, self.prid)
+        self.rid = self.recall["召回编号"]
+
+    def test_expand_adds_tasks_shrink_keeps_manual_hold(self):
+        svc = self.w.svc
+        stock = self.w.task_by(self.recall, 位置="在库", 保管方="企业")
+        transit = self.w.task_by(self.recall, 位置="在途")
+
+        # 在途由企业人工拦截（离线），属于人工处置
+        svc.notify_task(self.w.ent, transit["任务编号"])
+        svc.disposal_receipt(self.w.ent, transit["任务编号"], "拦截",
+                             "M-1", "30", offline=True)
+
+        # 缩小到只剩成品：在库系统隔离自动解除，在途人工拦截不释放
+        svc.reshape_recall(self.w.reg, self.rid, "缩小", "成品", self.w.gid)
+        view = svc.get_recall(self.w.reg, self.rid)
+        stock_t = self.w.task_by(view, 节点类型="交货单", 保管方="企业", 位置="在库")
+        transit_t = self.w.task_by(view, 位置="在途")
+        self.assertEqual(stock_t["状态"], "已解除")
+        self.assertEqual(stock_t["已解除kg"], "40")
+        self.assertEqual(transit_t["状态"], "出围待核")
+        self.assertEqual(transit_t["隔离中kg"], "30")
+
+        # 再扩大回批次：补建范围，人工冻结的在途货仍保持冻结
+        svc.reshape_recall(self.w.reg, self.rid, "扩大", "过磅批次", self.w.bid)
+        view = svc.get_recall(self.w.reg, self.rid)
+        transit_t = self.w.task_by(view, 位置="在途")
+        self.assertEqual(transit_t["状态"], "出围待核")
+        self.assertEqual(transit_t["隔离中kg"], "30")
+
+
+    def test_shrink_to_empty_scope_rejected(self):
+        svc = self.w.svc
+        # 一个与召回无关、没有任何货物的地块
+        empty_plot = svc.create_plot(self.w.coop, self.w.other_id, "空地", "广兴镇")["地块编号"]
+        with self.assertRaises(Conflict) as cm:
+            svc.reshape_recall(self.w.reg, self.rid, "缩小", "地块", empty_plot)
+        self.assertEqual(cm.exception.code, "empty_recall_scope")
+
+
+class RecallConflictTest(unittest.TestCase):
+    def setUp(self):
+        self.w = RecallWorld()
+        self.prid = self.w.fail_pesticide()
+        self.recall = self.w.svc.open_recall(
+            self.w.reg, "过磅批次", self.w.bid, self.prid)
+        self.rid = self.recall["召回编号"]
+
+    def test_conflict_freezes_until_authorized_review(self):
+        svc = self.w.svc
+        transit = self.w.task_by(self.recall, 位置="在途")
+        svc.report_conflict(self.w.ent, transit["任务编号"],
+                            "该车已于通知前卸货，数量对不上")
+        # 裁决前任何处置被冻结
+        with self.assertRaises(Conflict) as cm:
+            svc.disposal_receipt(self.w.ent, transit["任务编号"], "拦截", "X1", "30")
+        self.assertEqual(cm.exception.code, "conflict_pending")
+        # 重复上报冲突拒绝
+        with self.assertRaises(Conflict):
+            svc.report_conflict(self.w.ent, transit["任务编号"], "再报一次")
+        # 未裁决不能结案
+        with self.assertRaises(Conflict) as cm:
+            svc.close_recall(self.w.reg, self.rid)
+        self.assertEqual(cm.exception.code, "conflict_pending")
+
+    def test_resolve_release_restores_held_funds(self):
+        svc = self.w.svc
+        transit = self.w.task_by(self.recall, 位置="在途")
+        # 先人工隔离，再挂冲突
+        svc.notify_task(self.w.ent, transit["任务编号"])
+        svc.disposal_receipt(self.w.ent, transit["任务编号"], "隔离", "Q1", "30")
+        svc.report_conflict(self.w.ent, transit["任务编号"], "疑似同批但非同车")
+        # 监管先挂账暂缓 300，裁决解除后应自动恢复
+        svc.recall_fund(self.w.reg, self.rid, self.w.sid, "暂缓", "300", "等待冲突结论")
+        conf = svc.get_recall(self.w.reg, self.rid)["冲突"][0]
+        svc.resolve_conflict(self.w.reg, conf["冲突编号"], "解除隔离", "复检合格，解除")
+        view = svc.get_recall(self.w.reg, self.rid)
+        task = self.w.task_by(view, 位置="在途")
+        self.assertEqual(task["状态"], "已解除")
+        kinds = [f["种类"] for f in view["追加账"]]
+        self.assertIn("恢复", kinds)
+        self.assertEqual(sum(1 for k in kinds if k == "恢复"), 1)
+
+    def test_resolve_hold_keeps_quarantine(self):
+        svc = self.w.svc
+        transit = self.w.task_by(self.recall, 位置="在途")
+        svc.report_conflict(self.w.ent, transit["任务编号"], "数量异议")
+        conf = svc.get_recall(self.w.reg, self.rid)["冲突"][0]
+        svc.resolve_conflict(self.w.reg, conf["冲突编号"], "维持隔离", "确认超标")
+        view = svc.get_recall(self.w.reg, self.rid)
+        self.assertEqual(self.w.task_by(view, 位置="在途")["状态"], "已隔离")
+
+
+class RecallFundTest(unittest.TestCase):
+    def setUp(self):
+        self.w = RecallWorld()
+        self.prid = self.w.fail_pesticide()
+        self.recall = self.w.svc.open_recall(
+            self.w.reg, "过磅批次", self.w.bid, self.prid)
+        self.rid = self.recall["召回编号"]
+
+    def test_fund_cap_follows_grade_appeal_and_original_unchanged(self):
+        svc = self.w.svc
+        # 等级申诉降级 A->B：价差 -100，当前权益 300；原结算行仍 400 不改
+        svc.review_grade(self.w.reviewer, self.w.insp["检验编号"], "B", "农残伴生风伤，降级")
+        self.assertEqual(svc.get_settlement(self.w.coop, self.w.sid)
+                         ["明细行"][-1]["合计应收"], "400.00")
+        svc.recall_fund(self.w.reg, self.rid, self.w.sid, "暂缓", "300", "全额暂缓")
+        with self.assertRaises(Conflict) as cm:
+            svc.recall_fund(self.w.reg, self.rid, self.w.sid, "追回", "1")
+        self.assertEqual(cm.exception.code, "fund_exceeded")
+        # 恢复不得超过未解除挂账
+        with self.assertRaises(Conflict):
+            svc.recall_fund(self.w.reg, self.rid, self.w.sid, "恢复", "301")
+        svc.recall_fund(self.w.reg, self.rid, self.w.sid, "恢复", "100", "部分解除")
+        view = svc.get_recall(self.w.reg, self.rid)
+        self.assertEqual(len(view["追加账"]), 2)
+
+    def test_farmer_sees_own_fund_only(self):
+        svc = self.w.svc
+        svc.recall_fund(self.w.reg, self.rid, self.w.sid, "暂缓", "200", "暂缓")
+        view = svc.get_recall(self.w.farmer, self.rid)
+        self.assertEqual(len(view["追加账"]), 1)
+        self.assertEqual(view["追加账"][0]["种类"], "暂缓")
+
+
+class RecallVisibilityTest(unittest.TestCase):
+    def setUp(self):
+        self.w = RecallWorld()
+        self.prid = self.w.fail_pesticide()
+        self.recall = self.w.svc.open_recall(
+            self.w.reg, "过磅批次", self.w.bid, self.prid)
+        self.rid = self.recall["召回编号"]
+
+    def test_each_role_sees_only_duty_data(self):
+        svc = self.w.svc
+        # 护树队：召回一律 403
+        with self.assertRaises(PermissionDenied):
+            svc.list_recalls(self.w.guard)
+        with self.assertRaises(PermissionDenied):
+            svc.get_recall(self.w.guard, self.rid)
+        # 监管看全量
+        reg_view = svc.get_recall(self.w.reg, self.rid)
+        self.assertEqual(len(reg_view["任务"]), 3)
+        # 企业只见在库/在途两个原料节点，不见加工方成品，也不见资金
+        ent_view = svc.get_recall(self.w.ent, self.rid)
+        self.assertEqual({t["保管方"] for t in ent_view["任务"]}, {"企业", "承运方"})
+        self.assertEqual(ent_view["追加账"], [])
+        # 加工方只见成品
+        proc_view = svc.get_recall(self.w.proc, self.rid)
+        self.assertEqual([t["节点类型"] for t in proc_view["任务"]], ["成品"])
+        # 农户只见挂到本人农户的原料节点（成品任务农户编号为空）
+        farm_view = svc.get_recall(self.w.farmer, self.rid)
+        self.assertTrue(all(t.get("农户编号") == self.w.farmer_id for t in farm_view["任务"]))
+        # 跨企业不可见
+        with self.assertRaises(PermissionDenied):
+            svc.get_recall(self.w.ent2, self.rid)
+        # 别家加工方不可见、不可处置本加工方成品
+        goods = next(t for t in reg_view["任务"] if t["节点类型"] == "成品")
+        with self.assertRaises(PermissionDenied):
+            svc.get_recall(self.w.proc2, self.rid)
+        with self.assertRaises(PermissionDenied):
+            svc.notify_task(self.w.proc2, goods["任务编号"])
+        # 守恒报告不对企业开放
+        with self.assertRaises(PermissionDenied):
+            svc.recall_report(self.w.ent, self.rid)
+
+
+class ReturnedGoodsRecallTest(unittest.TestCase):
+    def test_returned_fruit_is_located_as_return_holding(self):
+        w = RecallWorld()
+        svc = w.svc
+        # 企业从在库退 10kg（在库随之 40->30）
+        ret = svc.enterprise_return(w.ent, w.did, "10", "到货农残抽检异常",
+                                    w.insp["检验编号"], "待处置")
+        prid = w.fail_pesticide()
+        r = svc.open_recall(w.reg, "过磅批次", w.bid, prid)
+        units = {(t["节点类型"], t["保管方"]): t for t in r["任务"]}
+        self.assertIn(("退货单", "企业"), units)
+        self.assertEqual(units[("退货单", "企业")]["任务重量kg"], "10")
+        # 在库量已扣减退货
+        stock = units.get(("交货单", "企业"))
+        self.assertEqual(stock["任务重量kg"], "30")
+        # 退货果实可销毁
+        t = units[("退货单", "企业")]
+        svc.notify_task(w.ent, t["任务编号"])
+        svc.disposal_receipt(w.ent, t["任务编号"], "隔离", "RT-1", "10")
+        svc.disposal_receipt(w.ent, t["任务编号"], "销毁", "RT-2", "10")
+        view = svc.get_recall(w.reg, r["召回编号"])
+        done = [x for x in view["任务"] if x["节点类型"] == "退货单"][0]
+        self.assertEqual(done["已销毁kg"], "10")
 
 
 if __name__ == "__main__":

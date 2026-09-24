@@ -71,9 +71,10 @@ def make_handler(service: HeritageCitrusService):
                 if path == "/health":
                     self._send(200, health_payload())
                     return
-                known = (path == "/batches" or path == "/trace"
+                known = (path == "/batches" or path == "/trace" or path == "/recalls"
                          or path.startswith(("/batches/", "/trees/",
-                                             "/settlements/", "/ledgers/")))
+                                             "/settlements/", "/ledgers/",
+                                             "/recalls/")))
                 if not known:
                     self._send(404, {"error": "not_found", "message": "未知路由"})
                     return
@@ -82,6 +83,14 @@ def make_handler(service: HeritageCitrusService):
 
                 if path == "/batches":
                     self._send(200, {"记录": self.svc.list_batches(actor)})
+                elif path == "/recalls":
+                    self._send(200, {"记录": self.svc.list_recalls(actor)})
+                elif path.startswith("/recalls/"):
+                    parts = path.split("/")
+                    if len(parts) == 4 and parts[3] == "report":
+                        self._send(200, self.svc.recall_report(actor, parts[2]))
+                    else:
+                        self._send(200, self.svc.get_recall(actor, parts[2]))
                 elif path.startswith("/batches/"):
                     self._send(200, self.svc.get_batch_detail(actor, path.split("/")[2]))
                 elif path.startswith("/trees/"):
@@ -121,6 +130,12 @@ def make_handler(service: HeritageCitrusService):
                     "/batches", "/reservations", "/weigh", "/inspections", "/reviews",
                     "/price-rules", "/contracts", "/deliveries", "/settlements",
                     "/returns", "/losses", "/processing", "/reports",
+                    "/pesticide-reviews",
+                    "/processing-ship", "/processing-arrive", "/processing-batches",
+                    "/goods-ship", "/goods-deliver",
+                    "/recalls", "/recall-reshape", "/recall-notify",
+                    "/recall-receipts", "/recall-conflicts", "/conflict-resolve",
+                    "/recall-funds", "/recall-close",
                 }
                 if path not in known_post:
                     self._send(404, {"error": "not_found", "message": "未知路由"})
@@ -197,6 +212,59 @@ def make_handler(service: HeritageCitrusService):
                 elif path == "/reports":
                     self._send(201, svc.report_tree_issue(
                         actor, data["树群编号"], data["类型"], data["描述"]))
+                elif path == "/pesticide-reviews":
+                    self._send(201, svc.pesticide_review(
+                        actor, data["检验编号"], data["项目"], data["结果"],
+                        data["实测值"], data["限量值"], data["判定依据"]))
+                elif path == "/processing-ship":
+                    self._send(201, svc.ship_to_processing(
+                        actor, data["交货单编号"], data["重量kg"]))
+                elif path == "/processing-arrive":
+                    self._send(201, svc.arrive_at_processor(
+                        actor, data["交货单编号"], data["重量kg"]))
+                elif path == "/processing-batches":
+                    self._send(201, svc.create_processing_batch(
+                        actor, data.get("制品", ""), data["原料行"],
+                        data["成品"], data.get("经办人", "")))
+                elif path == "/goods-ship":
+                    self._send(201, svc.ship_finished_goods(
+                        actor, data["成品编号"]))
+                elif path == "/goods-deliver":
+                    self._send(201, svc.deliver_finished_goods(
+                        actor, data["成品编号"]))
+                elif path == "/recalls":
+                    self._send(201, svc.open_recall(
+                        actor, data["起点类型"], data["起点编号"],
+                        data["农残编号"], data.get("备注", "")))
+                elif path == "/recall-reshape":
+                    self._send(201, svc.reshape_recall(
+                        actor, data["召回编号"], data["操作"],
+                        data["起点类型"], data["起点编号"], data.get("备注", "")))
+                elif path == "/recall-notify":
+                    self._send(201, svc.notify_task(
+                        actor, data["任务编号"], data.get("渠道", "系统消息"),
+                        bool(data.get("离线", False))))
+                elif path == "/recall-receipts":
+                    self._send(201, svc.disposal_receipt(
+                        actor, data["任务编号"], data["动作"], data["回执流水号"],
+                        weight_kg=data.get("重量kg"),
+                        offline=bool(data.get("离线补录", False)),
+                        note=data.get("备注", "")))
+                elif path == "/recall-conflicts":
+                    self._send(201, svc.report_conflict(
+                        actor, data["任务编号"], data["上报内容"]))
+                elif path == "/conflict-resolve":
+                    self._send(201, svc.resolve_conflict(
+                        actor, data["冲突编号"], data["裁决"],
+                        data.get("裁决意见", "")))
+                elif path == "/recall-funds":
+                    self._send(201, svc.recall_fund(
+                        actor, data["召回编号"], data["结算编号"],
+                        data["种类"], amount=data.get("金额"),
+                        summary=data.get("摘要", ""),
+                        linked_id=data.get("关联追回编号")))
+                elif path == "/recall-close":
+                    self._send(201, svc.close_recall(actor, data["召回编号"]))
                 else:
                     self._send(404, {"error": "not_found", "message": "未知路由"})
             except KeyError as exc:
