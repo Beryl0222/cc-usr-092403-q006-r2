@@ -15,6 +15,12 @@
   独立的价差调整（补付或扣回），不覆盖原结算。
 * **四条独立流水**：农户结算 / 企业退货 / 运输损耗 / 果肉加工路线（陈皮等）分账记录，
   互不混记。
+* **农残复核异常与召回**：召回可从地块/过磅批次/加工批次/成品任一节点发起，沿
+  「来源 → 投入/成品」父子数量关系形成带版本号的召回范围，定位每个货权节点的当前
+  保管方并分派隔离/拦截/退回/销毁/解除/替代交付任务。扩范围补建任务、缩范围不自动
+  解除人工隔离；离线回执与重复通知按回执号只产生一次业务效果；处置数量冲突挂起等待
+  监管授权复核；原检验与历史结算永不变写，资金一律以追加账记录暂缓/追回/恢复；结案
+  必须交代数量守恒、未回执节点与每笔资金变化。
 * **角色隔离**：护树队只能上报病害与违规采摘，读取树群管护视图，无法接触农户
   结算明细；不同农户之间也互不可见。
 """
@@ -31,11 +37,13 @@ from decimal import Decimal, ROUND_HALF_UP
 # 角色
 # ---------------------------------------------------------------------------
 
-ROLE_FARMER = "果农"          # 查看本人地块/批次/应收
+ROLE_FARMER = "果农"          # 查看本人地块/批次/应收与本人召回任务
 ROLE_COOP = "合作社"          # 全链管理与结算
 ROLE_REVIEWER = "质量复核人"  # 取样、复核改级
 ROLE_GUARD = "护树队"         # 仅上报病害、违规采摘
 ROLE_ENTERPRISE = "收购企业"  # 交货对接、成品原料反查
+ROLE_PROCESSOR = "加工方"     # 加工批次、成品与召回处置
+ROLE_REGULATOR = "监管人员"   # 发起召回、授权复核、结案
 
 # 结算明细属于合作社财务域，护树队无权查看
 SETTLER_ROLES = {ROLE_COOP}
@@ -309,6 +317,173 @@ class Violation:
 
 
 # ---------------------------------------------------------------------------
+# 加工与召回
+# ---------------------------------------------------------------------------
+
+# 召回处置六类动作
+ACTION_QUARANTINE = "隔离"       # 在库货物就地封存
+ACTION_INTERCEPT = "拦截"        # 在途货物拦停
+ACTION_RETURN = "退回"           # 退回上一保管方
+ACTION_DESTROY = "销毁"          # 监督销毁
+ACTION_RELEASE = "解除"          # 解除控制（含确认未受影响）
+ACTION_REPLACE = "替代交付"      # 以合格货替代交付
+
+DISPOSE_ACTIONS = {ACTION_QUARANTINE, ACTION_INTERCEPT, ACTION_RETURN,
+                   ACTION_DESTROY, ACTION_RELEASE, ACTION_REPLACE}
+# 实际消耗/转移受控数量、需要参与守恒勾稽的动作
+CONSUMING_ACTIONS = {ACTION_RETURN, ACTION_DESTROY, ACTION_REPLACE}
+
+# 资金追加账类型
+FUND_HOLD = "暂缓"               # 暂缓支付
+FUND_CLAIM_BACK = "追回"         # 已付款追回
+FUND_RESTORE = "恢复"            # 暂缓解除、恢复支付
+
+# 召回可发起的节点类型
+NODE_PLOT = "地块"
+NODE_TICKET = "过磅批次"
+NODE_PROCESS_BATCH = "加工批次"
+NODE_PRODUCT = "成品"
+RECALL_NODE_TYPES = {NODE_PLOT, NODE_TICKET, NODE_PROCESS_BATCH, NODE_PRODUCT}
+
+# 任务生命周期
+TASK_PENDING = "待通知"
+TASK_NOTIFIED = "待回执"
+TASK_DONE = "已处置"
+TASK_DISPUTED = "冲突待复核"
+
+
+@dataclass
+class ProcessingBatch:
+    编号: str
+    加工方: str
+    时间: str
+    制品: str
+    投入明细: list[dict] = field(default_factory=list)  # [{来源类型,来源单号,重量kg}]
+    投入合计kg: Decimal = Decimal("0")
+
+
+@dataclass
+class FinishedGood:
+    编号: str
+    加工批次编号: str
+    名称: str
+    批次号: str
+    重量kg: Decimal
+    时间: str
+    当前保管方: str                # actor.name：加工方/企业/...
+    保管方角色: str
+    地点: str = ""
+    状态: str = "在库"             # 在库/在途/已替代/已销毁
+
+
+@dataclass
+class RecallScopeVersion:
+    版本: int
+    时间: str
+    操作: str                      # 建立/扩大/缩小
+    节点: list[str]                # 该版本完整范围内的货权节点编号
+    说明: str = ""
+
+
+@dataclass
+class RecallTask:
+    编号: str
+    召回编号: str
+    节点类型: str                  # 过磅批次/加工批次/成品
+    节点编号: str
+    保管方: str                    # 农户编号 / 企业名 / 加工方名
+    保管方角色: str
+    动作: str
+    受控数量kg: Decimal            # 该节点受当前范围影响的数量（按父子数量关系摊算）
+    状态: str = TASK_PENDING
+    加入版本: int = 1
+    移出版本: int | None = None
+    人工隔离: bool = False         # 人工隔离后，缩范围不自动释放
+    已处置kg: Decimal = Decimal("0")
+    处置去向: dict = field(default_factory=dict)  # 动作 -> 累计kg
+    关闭版本: int | None = None
+    保管方已回执: bool = False
+    授权解除: bool = False
+    备注: str = ""
+
+
+@dataclass
+class RecallNotice:
+    编号: str
+    召回编号: str
+    任务编号: str
+    渠道: str
+    时间: str
+    内容指纹: str
+
+
+@dataclass
+class RecallReceipt:
+    编号: str
+    召回编号: str
+    任务编号: str
+    回执号: str                    # 离线凭证号/报文号，幂等键
+    保管方: str
+    动作: str
+    数量kg: Decimal
+    时间: str
+    离线: bool
+    重复: bool = False
+    首次通知编号: str | None = None
+
+
+@dataclass
+class RecallConflict:
+    编号: str
+    召回编号: str
+    任务编号: str
+    保管方: str
+    上报数量kg: Decimal
+    系统数量kg: Decimal
+    原因: str
+    时间: str
+    状态: str = "待授权"           # 待授权/已授权维持/已授权调整/已驳回
+    授权人: str | None = None
+    授权时间: str | None = None
+    授权意见: str = ""
+    认定数量kg: Decimal | None = None
+
+
+@dataclass
+class RecallFundEntry:
+    编号: str
+    召回编号: str
+    类型: str                      # 暂缓/追回/恢复
+    结算编号: str
+    农户编号: str
+    磅单编号: str
+    重量kg: Decimal
+    金额: str
+    时间: str
+    依据: str
+    关联编号: str | None = None    # 恢复关联原暂缓/追回
+    操作人: str = ""
+
+
+@dataclass
+class Recall:
+    编号: str
+    发起节点类型: str
+    发起节点编号: str
+    原因: str
+    检验依据编号: str
+    发起人: str
+    发起时间: str
+    当前版本: int = 0
+    版本历史: list[RecallScopeVersion] = field(default_factory=list)
+    范围内节点: set[str] = field(default_factory=set)        # 货权节点编号（磅单/加工批次/成品）
+    状态: str = "处置中"           # 处置中/已结案
+    结案时间: str | None = None
+    结案报告: dict | None = None
+    确认未受影响: bool = False
+
+
+# ---------------------------------------------------------------------------
 # 领域服务
 # ---------------------------------------------------------------------------
 
@@ -336,6 +511,18 @@ class HeritageCitrusService:
         self._losses: dict[str, TransitLoss] = {}
         self._routes: dict[str, ProcessingRoute] = {}
         self._violations: dict[str, Violation] = {}
+
+        # 加工与召回
+        self._process_batches: dict[str, ProcessingBatch] = {}
+        self._goods: dict[str, FinishedGood] = {}
+        self._recalls: dict[str, Recall] = {}
+        self._recall_tasks: dict[str, RecallTask] = {}
+        self._recall_notices: dict[str, RecallNotice] = {}
+        self._recall_receipts: dict[str, RecallReceipt] = {}
+        self._recall_conflicts: dict[str, RecallConflict] = {}
+        self._recall_funds: dict[str, RecallFundEntry] = {}
+        # 已暂缓/追回资金占用：结算编号 -> 磅单编号 -> 累计占用重量
+        self._fund_holds: dict[str, dict[str, Decimal]] = {}
 
         # 配额：树群 -> 季 -> 限额
         self._quotas: dict[tuple[str, str], dict] = {}
@@ -369,7 +556,8 @@ class HeritageCitrusService:
 
     def register_actor(self, token: str, name: str, role: str, farmer_id: str | None = None) -> dict:
         with self._lock:
-            if role not in {ROLE_FARMER, ROLE_COOP, ROLE_REVIEWER, ROLE_GUARD, ROLE_ENTERPRISE}:
+            if role not in {ROLE_FARMER, ROLE_COOP, ROLE_REVIEWER, ROLE_GUARD,
+                            ROLE_ENTERPRISE, ROLE_PROCESSOR, ROLE_REGULATOR}:
                 raise ValidationFailed("未知角色")
             if role == ROLE_FARMER and not farmer_id:
                 raise ValidationFailed("果农身份必须绑定农户编号")
@@ -790,6 +978,16 @@ class HeritageCitrusService:
                 raise Conflict("already_settled",
                                f"该交货批次全部磅单已结算（{sorted(set(settled))}），每公斤果实只能结算一次")
 
+            # 召回闸门：仍处于召回处置中的磅单不得结算（暂缓支付在召回侧以追加账体现）
+            blocked = sorted({
+                t.过磅流水号 for t in fresh
+                if self._ticket_under_active_recall(t.编号)
+            })
+            if blocked:
+                raise Conflict(
+                    "recall_hold",
+                    f"以下过磅批次处于农残召回处置中，暂缓结算，待解除后恢复：{blocked}")
+
             sid = self._id("结算")
             settlement = Settlement(
                 编号=sid, 农户编号=delivery.农户编号, 批次编号=batch.编号,
@@ -1059,6 +1257,918 @@ class HeritageCitrusService:
             return self._returns[source_id].交货单编号
         return self._losses[source_id].交货单编号
 
+    # ------------------------------------------------------------------ 加工批次与成品
+
+    def register_processing_batch(self, actor: Actor, product: str,
+                                  inputs: list[dict], at: str | None = None) -> dict:
+        """加工方建档加工批次：逐笔登记来源（交货/退货/损耗），构成父子数量关系边。
+
+        加工投入不得超过来源可处置量（退货/损耗与既有果肉加工路线共享额度）。
+        """
+        self._require_role(actor, {ROLE_PROCESSOR, ROLE_COOP}, "建档加工批次")
+        with self._lock:
+            if not inputs:
+                raise ValidationFailed("加工批次必须至少有一笔来源投入")
+            total = Decimal("0")
+            lines = []
+            for line in inputs:
+                stype = line.get("来源类型")
+                sid = line.get("来源单号")
+                amount = self._dec(line.get("重量kg"), "投入重量")
+                if amount <= 0:
+                    raise ValidationFailed("投入重量必须大于零")
+                source_weight, used = self._source_disposable(stype, sid)
+                if used + amount > source_weight:
+                    raise ValidationFailed(
+                        f"加工投入 {used + amount}kg 超过来源 {stype} {sid} "
+                        f"可处置量 {source_weight}kg")
+                total += amount
+                lines.append({"来源类型": stype, "来源单号": sid, "重量kg": amount})
+            pid = self._id("加工批")
+            rec = ProcessingBatch(pid, actor.name, at or _now(), product, lines, total)
+            self._process_batches[pid] = rec
+            return self._process_batch_view(rec)
+
+    def _source_disposable(self, stype: str, sid: str) -> tuple[Decimal, Decimal]:
+        """返回 (来源总量, 已被加工批次与果肉路线占用的量)。"""
+        if stype == "交货":
+            src = self._deliveries.get(sid)
+        elif stype == "退货":
+            src = self._returns.get(sid)
+        elif stype == "损耗":
+            src = self._losses.get(sid)
+        else:
+            raise ValidationFailed("加工来源类型必须是 交货 / 退货 / 损耗")
+        if src is None:
+            raise NotFound("加工来源单据")
+        used = sum(
+            line["重量kg"] for pb in self._process_batches.values()
+            for line in pb.投入明细
+            if line["来源类型"] == stype and line["来源单号"] == sid
+        )
+        if stype in {"退货", "损耗"}:
+            used += sum(r.投入重量kg for r in self._routes.values()
+                        if r.来源类型 == stype and r.来源单号 == sid)
+            return src.重量kg, used
+        # 直接用交货果实加工：可处置量 = 核定毛重 − 运输损耗 − 已退货，
+        # 损耗与退货各自还能走退货/损耗加工路线，互不重复。
+        available = src.毛重kg
+        available -= sum(r.重量kg for r in self._returns.values()
+                         if r.交货单编号 == sid)
+        available -= sum(ls.损耗kg for ls in self._losses.values()
+                         if ls.交货单编号 == sid)
+        return available, used
+
+    def register_good(self, actor: Actor, process_batch_id: str, name: str,
+                      batch_no: str, weight_kg, custodian: str = "",
+                      location: str = "", status: str = "在库",
+                      at: str | None = None) -> dict:
+        """成品入库上报：成品必须挂在加工批次下，成品合计不得超过加工投入量。"""
+        self._require_role(actor, {ROLE_PROCESSOR, ROLE_COOP}, "成品上报")
+        weight = self._dec(weight_kg, "成品重量")
+        if status not in {"在库", "在途"}:
+            raise ValidationFailed("上报时成品状态只能是 在库 / 在途")
+        with self._lock:
+            pb = self._process_batches.get(process_batch_id)
+            if pb is None:
+                raise NotFound("加工批次")
+            custodian_name = custodian or actor.name
+            custodian_role = self._custodian_role(custodian_name, actor)
+            made = sum(g.重量kg for g in self._goods.values()
+                       if g.加工批次编号 == process_batch_id)
+            if made + weight > pb.投入合计kg:
+                raise ValidationFailed(
+                    f"成品合计 {made + weight}kg 超过加工批次投入 {pb.投入合计kg}kg")
+            gid = self._id("成品")
+            good = FinishedGood(gid, process_batch_id, name, batch_no, weight,
+                                at or _now(), custodian_name, custodian_role,
+                                location, status)
+            self._goods[gid] = good
+            return self._good_view(good)
+
+    def _custodian_role(self, custodian_name: str, actor: Actor) -> str:
+        """保管方必须是已登记的加工方或收购企业；自报时直接取本人角色。"""
+        if custodian_name == actor.name:
+            if actor.role not in {ROLE_PROCESSOR, ROLE_ENTERPRISE}:
+                raise ValidationFailed("成品保管方只能是加工方或收购企业")
+            return actor.role
+        for a in self._actors.values():
+            if a.name == custodian_name:
+                if a.role not in {ROLE_PROCESSOR, ROLE_ENTERPRISE}:
+                    raise ValidationFailed("成品保管方只能是加工方或收购企业")
+                return a.role
+        raise ValidationFailed(f"成品保管方「{custodian_name}」尚未登记为加工方/企业")
+
+    # ------------------------------------------------------------------ 召回发起与范围版本
+
+    def initiate_recall(self, actor: Actor, node_type: str, node_id: str,
+                        reason: str, inspection_id: str) -> dict:
+        """从 地块/过磅批次/加工批次/成品 任一节点发起召回，形成范围版本 v1。"""
+        self._require_role(actor, {ROLE_REGULATOR}, "发起农残召回")
+        with self._lock:
+            if node_type not in RECALL_NODE_TYPES:
+                raise ValidationFailed(
+                    "召回发起节点必须是 地块/过磅批次/加工批次/成品")
+            if inspection_id not in self._inspections:
+                raise NotFound("农残检验依据")
+            affected = self._affected_nodes(node_type, node_id)
+            if not affected:
+                raise ValidationFailed("发起节点向下没有任何可定位的货物，无需召回")
+            rid = self._id("召回")
+            recall = Recall(rid, node_type, node_id, reason, inspection_id,
+                            actor.name, _now())
+            self._recalls[rid] = recall
+            self._apply_scope(recall, affected, "建立", "首次发起")
+            return self._recall_view(recall, actor)
+
+    def _affected_nodes(self, anchor_type: str, anchor_id: str) -> dict[str, dict]:
+        """沿父子数量关系计算锚点下游全部 *当前仍在控* 的货权节点。
+
+        同一批货在链上只计一次：已进入加工批次的交货量不再算企业在库，已制成成品
+        的投入量留在成品节点（加工批节点只承载尚未成品的在制余量）。
+        返回 {节点编号: {类型, 重量kg}}。
+        """
+        nodes: dict[str, dict] = {}
+
+        def add(node_id: str, ntype: str, weight: Decimal):
+            if weight <= 0:
+                return
+            prev = nodes.get(node_id)
+            if prev is None or weight > prev["重量kg"]:
+                nodes[node_id] = {"类型": ntype, "重量kg": weight}
+
+        ticket_ids: list[str] = []
+        if anchor_type == NODE_PLOT:
+            plot = self._plots.get(anchor_id)
+            if plot is None:
+                raise NotFound("地块")
+            ticket_ids = [t.编号 for b in self._batches.values()
+                          if b.地块编号 == anchor_id
+                          for t in self._tickets.values()
+                          if t.批次编号 == b.编号]
+        elif anchor_type == NODE_TICKET:
+            ticket = self._tickets.get(anchor_id)
+            if ticket is None:
+                raise NotFound("过磅批次（磅单）")
+            ticket_ids = [anchor_id]
+        elif anchor_type == NODE_PROCESS_BATCH:
+            if anchor_id not in self._process_batches:
+                raise NotFound("加工批次")
+            self._add_downstream_process(nodes, {anchor_id})
+            return nodes
+        elif anchor_type == NODE_PRODUCT:
+            good = self._goods.get(anchor_id)
+            if good is None:
+                raise NotFound("成品")
+            add(anchor_id, NODE_PRODUCT, good.重量kg)
+            return nodes
+
+        # 来源侧：过磅批次（磅单）。已交货的部分要扣除已转入加工的数量
+        delivery_ids: set[str] = set()
+        delivery_of_ticket: dict[str, str] = {}
+        for tid in ticket_ids:
+            t = self._tickets[tid]
+            batch = self._batches[t.批次编号]
+            if batch.交货单编号:
+                delivery_ids.add(batch.交货单编号)
+                delivery_of_ticket[tid] = batch.交货单编号
+            else:
+                add(tid, NODE_TICKET, t.重量kg)
+        for did in delivery_ids:
+            delivery = self._deliveries[did]
+            tickets = [self._tickets[tid] for tid in ticket_ids
+                       if delivery_of_ticket.get(tid) == did]
+            processed = min(self._delivery_into_processing(did), delivery.毛重kg)
+            remainders = self._prorate(
+                {t.编号: t.重量kg for t in tickets}, delivery.毛重kg, processed)
+            for tid, remainder in remainders.items():
+                add(tid, NODE_TICKET, remainder)
+
+        # 交货 → 退货/损耗 → 加工批次 → 成品
+        pb_ids: set[str] = set()
+        source_keys: set[tuple[str, str]] = set()
+        for did in delivery_ids:
+            source_keys.add(("交货", did))
+            for r in self._returns.values():
+                if r.交货单编号 == did:
+                    source_keys.add(("退货", r.编号))
+            for ls in self._losses.values():
+                if ls.交货单编号 == did:
+                    source_keys.add(("损耗", ls.编号))
+        for stype, sid in source_keys:
+            for pb in self._process_batches.values():
+                if any(line["来源类型"] == stype and line["来源单号"] == sid
+                       for line in pb.投入明细):
+                    pb_ids.add(pb.编号)
+        self._add_downstream_process(nodes, pb_ids)
+        return nodes
+
+    def _add_downstream_process(self, nodes: dict[str, dict], pb_ids: set[str]):
+        for pbid in pb_ids:
+            pb = self._process_batches[pbid]
+            made = sum(g.重量kg for g in self._goods.values()
+                       if g.加工批次编号 == pbid)
+            # 加工批节点承载在制余量；已成品部分挂到成品节点
+            wip = pb.投入合计kg - made
+            if wip > 0:
+                nodes[pbid] = {"类型": NODE_PROCESS_BATCH, "重量kg": wip}
+            for g in self._goods.values():
+                if g.加工批次编号 == pbid:
+                    nodes[g.编号] = {"类型": NODE_PRODUCT, "重量kg": g.重量kg}
+
+    @staticmethod
+    def _prorate(weights: dict[str, Decimal], gross: Decimal,
+                 processed: Decimal) -> dict[str, Decimal]:
+        """把已转入加工的数量按磅单重量比例从各磅单扣除，尾差并入第一张磅单。"""
+        if processed <= 0 or gross <= 0:
+            return dict(weights)
+        result: dict[str, Decimal] = {}
+        quant = Decimal("0.001")
+        allocated = Decimal("0")
+        keys = list(weights)
+        for i, k in enumerate(keys):
+            if i == len(keys) - 1:
+                cut = processed - allocated
+            else:
+                cut = (processed * weights[k] / gross).quantize(
+                    quant, rounding=ROUND_HALF_UP)
+                allocated += cut
+            remainder = weights[k] - cut
+            if remainder > 0:
+                result[k] = remainder
+        return result
+
+    def _delivery_into_processing(self, delivery_id: str) -> Decimal:
+        total = Decimal("0")
+        sources = {("交货", delivery_id)}
+        for r in self._returns.values():
+            if r.交货单编号 == delivery_id:
+                sources.add(("退货", r.编号))
+        for ls in self._losses.values():
+            if ls.交货单编号 == delivery_id:
+                sources.add(("损耗", ls.编号))
+        for pb in self._process_batches.values():
+            for line in pb.投入明细:
+                if (line["来源类型"], line["来源单号"]) in sources:
+                    total += line["重量kg"]
+        return total
+
+    def _fund_eligible_weights(self, recall: Recall,
+                               settlement: Settlement) -> dict[str, Decimal]:
+        """计算该结算单每张磅单与当前召回范围对应的受影响重量。
+
+        直接受控的磅单取其任务受控量；范围内加工批/成品则按加工投入构成把数量
+        沿父子边摊回来源交货，再按磅单重量比例摊到磅单。
+        """
+        eligible: dict[str, Decimal] = {}
+        per_delivery: dict[str, Decimal] = {}
+
+        def attribute(pb: ProcessingBatch, weight: Decimal):
+            for line in pb.投入明细:
+                st, sid = line["来源类型"], line["来源单号"]
+                share = weight * line["重量kg"] / pb.投入合计kg
+                if st == "交货":
+                    did = sid
+                elif st == "退货":
+                    did = self._returns[sid].交货单编号
+                else:
+                    did = self._losses[sid].交货单编号
+                per_delivery[did] = per_delivery.get(did, Decimal("0")) + share
+
+        for task in self._recall_tasks.values():
+            if task.召回编号 != recall.编号 or task.移出版本 is not None:
+                continue
+            if task.节点类型 == NODE_TICKET:
+                ticket = self._tickets[task.节点编号]
+                if ticket.结算编号 == settlement.编号:
+                    eligible[task.节点编号] = \
+                        eligible.get(task.节点编号, Decimal("0")) + task.受控数量kg
+            elif task.节点类型 == NODE_PROCESS_BATCH:
+                attribute(self._process_batches[task.节点编号], task.受控数量kg)
+            elif task.节点类型 == NODE_PRODUCT:
+                good = self._goods[task.节点编号]
+                attribute(self._process_batches[good.加工批次编号], task.受控数量kg)
+
+        did = settlement.交货单编号
+        attributed = per_delivery.get(did, Decimal("0"))
+        if attributed > 0:
+            rows = {r["磅单编号"]: Decimal(r["重量kg"])
+                    for r in settlement.行 if "磅单编号" in r}
+            gross = sum(rows.values(), Decimal("0"))
+            attributed = min(attributed, gross)
+            remainders = self._prorate(rows, gross, attributed)
+            for tid, line_weight in rows.items():
+                cut = line_weight - remainders.get(tid, Decimal("0"))
+                if cut > 0:
+                    eligible[tid] = eligible.get(tid, Decimal("0")) + cut
+        return eligible
+
+    def rescope_recall(self, actor: Actor, recall_id: str, node_type: str,
+                       node_id: str, note: str = "") -> dict:
+        """以新锚点重算范围：扩大补建任务；缩小不自动释放已被人工隔离的货物。"""
+        self._require_role(actor, {ROLE_REGULATOR}, "调整召回范围")
+        with self._lock:
+            recall = self._recalls.get(recall_id)
+            if recall is None:
+                raise NotFound("召回单")
+            self._require_recall_open(recall)
+            new_affected = self._affected_nodes(node_type, node_id)
+            new_ids = set(new_affected)
+            old_ids = set(recall.范围内节点)
+            if new_ids == old_ids:
+                raise Conflict("scope_unchanged", "新范围与当前版本一致，无需出新版")
+            op = "扩大" if new_ids > old_ids and not (old_ids - new_ids) else \
+                 "缩小" if old_ids > new_ids and not (new_ids - old_ids) else "调整"
+            self._apply_scope(recall, new_affected, op, note,
+                              removed=old_ids - new_ids)
+            recall.发起节点类型 = node_type
+            recall.发起节点编号 = node_id
+            return self._recall_view(recall, actor)
+
+    def _apply_scope(self, recall: Recall, affected: dict[str, dict], op: str,
+                     note: str, removed: set[str] | None = None):
+        """按范围差异补建/移出任务并落一个不可变的范围版本。"""
+        version = recall.当前版本 + 1
+        for node_id, info in affected.items():
+            if node_id in recall.范围内节点:
+                # 已在范围内：仅当任务尚未被通知/触碰时，按最新父子数量关系校正受控量；
+                # 一旦对外通知或有处置，数量以既有任务为准（差异走冲突授权复核）。
+                weight = info["重量kg"]
+                for t in self._recall_tasks.values():
+                    if t.召回编号 != recall.编号 or t.节点编号 != node_id \
+                            or t.移出版本 is not None:
+                        continue
+                    untouched = t.状态 == TASK_PENDING and not t.人工隔离 \
+                        and t.已处置kg == 0 and not any(
+                            n.任务编号 == t.编号 for n in self._recall_notices.values())
+                    if untouched and t.受控数量kg != weight:
+                        t.受控数量kg = weight
+                continue
+            ntype, weight = info["类型"], info["重量kg"]
+            custodian, custodian_role, default_action = self._custody_of(ntype, node_id)
+            tid = self._id("召回任务")
+            task = RecallTask(
+                编号=tid, 召回编号=recall.编号, 节点类型=ntype, 节点编号=node_id,
+                保管方=custodian, 保管方角色=custodian_role, 动作=default_action,
+                受控数量kg=weight, 加入版本=version,
+            )
+            self._recall_tasks[tid] = task
+        if removed:
+            for node_id in removed:
+                for task in self._recall_tasks.values():
+                    if task.召回编号 != recall.编号 or task.节点编号 != node_id:
+                        continue
+                    if task.移出版本 is not None:
+                        continue
+                    task.移出版本 = version
+                    # 已人工隔离/已实际处置的货物：缩范围不自动释放，留待人工决定
+                    if task.人工隔离 or task.已处置kg > 0 or task.状态 == TASK_DISPUTED:
+                        task.备注 = (task.备注 + " 范围缩小移出但保留人工处置").strip()
+                    else:
+                        # 未被人触碰的任务：系统直接移出，不产生对外业务效果
+                        task.状态 = TASK_DONE
+                        task.关闭版本 = version
+                        task.处置去向["解除（系统移出）"] = task.受控数量kg
+        recall.范围内节点 = set(affected)
+        recall.当前版本 = version
+        recall.版本历史.append(RecallScopeVersion(
+            版本=version, 时间=_now(), 操作=op, 节点=sorted(affected), 说明=note))
+
+    def _custody_of(self, ntype: str, node_id: str) -> tuple[str, str, str]:
+        """定位节点的当前保管方与首选处置动作。"""
+        if ntype == NODE_TICKET:
+            ticket = self._tickets[node_id]
+            batch = self._batches[ticket.批次编号]
+            if batch.状态 == "已交货":
+                return self._deliveries[batch.交货单编号].企业编号, ROLE_ENTERPRISE, ACTION_INTERCEPT
+            return batch.农户编号, ROLE_FARMER, ACTION_QUARANTINE
+        if ntype == NODE_PROCESS_BATCH:
+            return self._process_batches[node_id].加工方, ROLE_PROCESSOR, ACTION_QUARANTINE
+        good = self._goods[node_id]
+        action = ACTION_INTERCEPT if good.状态 == "在途" else ACTION_QUARANTINE
+        return good.当前保管方, good.保管方角色, action
+
+    # ------------------------------------------------------------------ 通知与离线回执
+
+    def notify_task(self, actor: Actor, recall_id: str, task_id: str,
+                    channel: str, content: str) -> dict:
+        """向保管方推送处置通知。重复通知（同任务同渠道同内容）只产生一次业务效果。"""
+        self._require_role(actor, {ROLE_REGULATOR, ROLE_COOP}, "发送召回通知")
+        with self._lock:
+            recall, task = self._load_recall_task(recall_id, task_id)
+            self._require_recall_open(recall)
+            fingerprint = f"{channel}|{content}"
+            for n in self._recall_notices.values():
+                if n.召回编号 == recall_id and n.任务编号 == task_id \
+                        and n.内容指纹 == fingerprint:
+                    return {"通知": self._notice_view(n), "重复": True}
+            nid = self._id("召回通知")
+            notice = RecallNotice(nid, recall_id, task_id, channel, _now(), fingerprint)
+            self._recall_notices[nid] = notice
+            if task.状态 == TASK_PENDING:
+                task.状态 = TASK_NOTIFIED
+            return {"通知": self._notice_view(notice), "重复": False}
+
+    def submit_receipt(self, actor: Actor, recall_id: str, task_id: str,
+                       receipt_no: str, action: str, weight_kg,
+                       offline=False, manual=False, note: str = "") -> dict:
+        """保管方离线/在线回执。回执号幂等：同号重传只返回原回执，不重复生效。
+
+        回执数量与系统受控数量不符时不做处置，登记冲突，等待监管授权复核。
+        """
+        with self._lock:
+            recall, task = self._load_recall_task(recall_id, task_id)
+            self._require_recall_open(recall)
+            self._require_custodian(actor, task)
+            if action not in DISPOSE_ACTIONS:
+                raise ValidationFailed(
+                    "回执动作必须是 隔离/拦截/退回/销毁/解除/替代交付")
+            qty = self._dec(weight_kg, "回执数量")
+            if qty <= 0:
+                raise ValidationFailed("回执数量必须大于零")
+
+            for r in self._recall_receipts.values():
+                if r.召回编号 == recall_id and r.回执号 == receipt_no:
+                    return {"回执": self._receipt_view(r), "冲突": None, "重复": True}
+
+            notice_id = next((n.编号 for n in self._recall_notices.values()
+                              if n.任务编号 == task_id), None)
+            rid = self._id("召回回执")
+            receipt = RecallReceipt(
+                编号=rid, 召回编号=recall_id, 任务编号=task_id, 回执号=receipt_no,
+                保管方=task.保管方, 动作=action, 数量kg=qty, 时间=_now(),
+                离线=bool(offline), 首次通知编号=notice_id)
+            self._recall_receipts[rid] = receipt
+
+            conflict = self._receipt_conflict(task, action, qty)
+            if conflict is not None:
+                cid = self._id("召回冲突")
+                rec = RecallConflict(cid, recall_id, task_id, task.保管方,
+                                     qty, conflict["系统数量"], conflict["原因"], _now())
+                self._recall_conflicts[cid] = rec
+                task.状态 = TASK_DISPUTED
+                return {"回执": self._receipt_view(receipt),
+                        "冲突": self._conflict_view(rec), "重复": False}
+
+            self._apply_receipt_effect(task, action, qty, manual)
+            task.保管方已回执 = True
+            return {"回执": self._receipt_view(receipt), "冲突": None, "重复": False}
+
+    def _receipt_conflict(self, task: RecallTask, action: str,
+                          qty: Decimal) -> dict | None:
+        controlled = task.受控数量kg
+        consumed = task.已处置kg
+        released = task.处置去向.get(ACTION_RELEASE, Decimal("0"))
+        held = task.处置去向.get(ACTION_QUARANTINE, Decimal("0")) + \
+            task.处置去向.get(ACTION_INTERCEPT, Decimal("0"))
+        if action in CONSUMING_ACTIONS:
+            if consumed + qty > controlled:
+                return {"系统数量": controlled - consumed,
+                        "原因": f"申报{action} {qty}kg，超出可处置余额 "
+                               f"{controlled - consumed}kg"}
+        elif action in {ACTION_QUARANTINE, ACTION_INTERCEPT}:
+            # 已销毁/退回/替代交付的部分不可能再被隔离
+            if held + qty - consumed > controlled:
+                return {"系统数量": controlled - held + consumed,
+                        "原因": f"申报控制 {held + qty - consumed}kg 超过受控量 {controlled}kg"}
+        elif action == ACTION_RELEASE:
+            residual = controlled - consumed - released
+            if qty > residual:
+                return {"系统数量": residual,
+                        "原因": f"申报解除 {qty}kg 超过未处置余额 {residual}kg"}
+        return None
+
+    def _apply_receipt_effect(self, task: RecallTask, action: str,
+                              qty: Decimal, manual: bool):
+        if action == ACTION_QUARANTINE:
+            task.处置去向[ACTION_QUARANTINE] = \
+                task.处置去向.get(ACTION_QUARANTINE, Decimal("0")) + qty
+            if manual:
+                task.人工隔离 = True
+        elif action == ACTION_INTERCEPT:
+            task.处置去向[ACTION_INTERCEPT] = \
+                task.处置去向.get(ACTION_INTERCEPT, Decimal("0")) + qty
+        elif action in CONSUMING_ACTIONS:
+            task.已处置kg += qty
+            task.处置去向[action] = task.处置去向.get(action, Decimal("0")) + qty
+            if action == ACTION_REPLACE and task.节点类型 == NODE_PRODUCT:
+                good = self._goods[task.节点编号]
+                good.状态 = "已替代"
+        elif action == ACTION_RELEASE:
+            task.处置去向[ACTION_RELEASE] = \
+                task.处置去向.get(ACTION_RELEASE, Decimal("0")) + qty
+        resolved = task.已处置kg + task.处置去向.get(ACTION_RELEASE, Decimal("0"))
+        if resolved >= task.受控数量kg:
+            task.状态 = TASK_DONE
+
+    def resolve_conflict(self, actor: Actor, conflict_id: str, decision: str,
+                         accepted_kg=None, opinion: str = "") -> dict:
+        """监管人员对数量冲突授权复核：维持原系统数量（驳回回执）或按认定数量调整。"""
+        self._require_role(actor, {ROLE_REGULATOR}, "授权复核召回冲突")
+        with self._lock:
+            conf = self._recall_conflicts.get(conflict_id)
+            if conf is None:
+                raise NotFound("召回冲突")
+            recall = self._recalls[conf.召回编号]
+            self._require_recall_open(recall)
+            if conf.状态 != "待授权":
+                raise Conflict("conflict_resolved", "该冲突已授权复核")
+            task = self._recall_tasks[conf.任务编号]
+            if decision == "维持":
+                conf.状态 = "已驳回"
+                notified = any(n.任务编号 == task.编号 for n in self._recall_notices.values())
+                task.状态 = TASK_NOTIFIED if notified else TASK_PENDING
+            elif decision == "调整":
+                if accepted_kg is None:
+                    raise ValidationFailed("授权调整必须给出认定数量kg")
+                accepted = self._dec(accepted_kg, "认定数量")
+                receipt = self._latest_receipt(conf.召回编号, conf.任务编号)
+                self._apply_receipt_effect(
+                    task, receipt.动作, accepted,
+                    manual=receipt.动作 == ACTION_QUARANTINE)
+                task.保管方已回执 = True
+                conf.状态 = "已授权调整"
+                conf.认定数量kg = accepted
+                # 隔离/拦截不是终态：若数量尚未交代完，回到待回执等待后续处置
+                if task.状态 == TASK_DISPUTED:
+                    task.状态 = TASK_NOTIFIED
+            else:
+                raise ValidationFailed("复核决定必须是 维持 / 调整")
+            conf.授权人 = actor.name
+            conf.授权时间 = _now()
+            conf.授权意见 = opinion
+            return self._conflict_view(conf)
+
+    def release_quarantine(self, actor: Actor, recall_id: str, task_id: str,
+                           weight_kg=None, note: str = "") -> dict:
+        """监管/合作社对人工隔离货物的显式解除——缩范围不会自动走到这里。"""
+        self._require_role(actor, {ROLE_REGULATOR, ROLE_COOP}, "解除人工隔离")
+        with self._lock:
+            recall, task = self._load_recall_task(recall_id, task_id)
+            self._require_recall_open(recall)
+            residual = task.受控数量kg - task.已处置kg \
+                - task.处置去向.get(ACTION_RELEASE, Decimal("0"))
+            qty = residual if weight_kg is None else self._dec(weight_kg, "解除数量")
+            if qty <= 0 or qty > residual:
+                raise ValidationFailed(f"可解除余额为 {residual}kg")
+            task.授权解除 = True
+            self._apply_receipt_effect(task, ACTION_RELEASE, qty, False)
+            task.备注 = (task.备注 + f" 授权解除：{note}").strip()
+            return self._task_view(task)
+
+    # ------------------------------------------------------------------ 资金追加账
+
+    def hold_funds(self, actor: Actor, recall_id: str, settlement_id: str,
+                   weight_kg=None, basis: str = "") -> dict:
+        """确认受影响后暂缓支付：以追加账记录，历史结算行一个字都不改。"""
+        return self._fund_action(actor, recall_id, settlement_id, FUND_HOLD,
+                                 weight_kg, basis)
+
+    def claim_back_funds(self, actor: Actor, recall_id: str, settlement_id: str,
+                         weight_kg=None, basis: str = "") -> dict:
+        """对已付款部分追回：同样只追加，不改原结算。"""
+        return self._fund_action(actor, recall_id, settlement_id, FUND_CLAIM_BACK,
+                                 weight_kg, basis)
+
+    def _fund_action(self, actor: Actor, recall_id: str, settlement_id: str,
+                     kind: str, weight_kg, basis: str) -> dict:
+        self._require_role(actor, {ROLE_REGULATOR, ROLE_COOP}, f"登记召回资金{kind}")
+        with self._lock:
+            recall = self._recalls.get(recall_id)
+            if recall is None:
+                raise NotFound("召回单")
+            self._require_recall_open(recall)
+            settlement = self._settlements.get(settlement_id)
+            if settlement is None:
+                raise NotFound("结算单")
+            # 只可对召回范围内（含沿父子关系反查到的来源过磅批次）的款项暂缓/追回，
+            # 金额按结算固化单价计算，与等级申诉价差调整各走各的追加账。
+            eligible = self._fund_eligible_weights(recall, settlement)
+            if not eligible:
+                raise ValidationFailed("该结算单没有处于召回范围内的磅单")
+            wanted = None if weight_kg is None else self._dec(weight_kg, f"{kind}重量")
+            occupancy = self._fund_holds.setdefault(settlement_id, {})
+            entries = []
+            remaining = wanted
+            total_amount = Decimal("0")
+            for row in settlement.行:
+                if "磅单编号" not in row:
+                    continue
+                if wanted is not None and remaining == 0:
+                    break
+                cap = eligible.get(row["磅单编号"], Decimal("0"))
+                used = occupancy.get(row["磅单编号"], Decimal("0"))
+                avail = min(Decimal(row["重量kg"]), cap) - used
+                if avail <= 0:
+                    continue
+                take = avail if remaining is None else min(avail, remaining)
+                unit = Decimal(row["单价"])
+                amount = unit * take
+                total_amount += amount
+                eid = self._id("召回资金")
+                entry = RecallFundEntry(
+                    编号=eid, 召回编号=recall_id, 类型=kind, 结算编号=settlement_id,
+                    农户编号=settlement.农户编号, 磅单编号=row["磅单编号"],
+                    重量kg=take, 金额=_money(amount),
+                    时间=_now(), 依据=basis or recall.原因,
+                    操作人=actor.name)
+                self._recall_funds[eid] = entry
+                occupancy[row["磅单编号"]] = used + take
+                entries.append(entry)
+                if remaining is not None:
+                    remaining -= take
+            if not entries:
+                raise Conflict("funds_already_covered",
+                               "范围内磅单的款项均已暂缓/追回，无可用余额")
+            if wanted is not None and remaining > 0:
+                raise Conflict(
+                    "funds_weight_exceeded",
+                    f"范围内可{kind}重量不足，尚差 {remaining}kg（已登记部分请核对）")
+            return {"类型": kind, "笔数": len(entries),
+                    "合计重量kg": str(sum((e.重量kg for e in entries), Decimal("0"))),
+                    "合计金额": _money(total_amount),
+                    "明细": [self._fund_view(e) for e in entries]}
+
+    def restore_funds(self, actor: Actor, recall_id: str, fund_entry_id: str) -> dict:
+        """解除暂缓/追回：以恢复追加账对冲原记录，原记录保留不删。"""
+        self._require_role(actor, {ROLE_REGULATOR, ROLE_COOP}, "恢复召回资金")
+        with self._lock:
+            recall = self._recalls.get(recall_id)
+            if recall is None:
+                raise NotFound("召回单")
+            self._require_recall_open(recall)
+            original = self._recall_funds.get(fund_entry_id)
+            if original is None or original.召回编号 != recall_id:
+                raise NotFound("原资金记录")
+            if original.类型 not in {FUND_HOLD, FUND_CLAIM_BACK}:
+                raise ValidationFailed("只能对 暂缓/追回 记录做恢复")
+            if any(e.关联编号 == fund_entry_id for e in self._recall_funds.values()):
+                raise Conflict("already_restored", "该笔资金已恢复，不能重复恢复")
+            eid = self._id("召回资金")
+            entry = RecallFundEntry(
+                编号=eid, 召回编号=recall_id, 类型=FUND_RESTORE,
+                结算编号=original.结算编号, 农户编号=original.农户编号,
+                磅单编号=original.磅单编号,
+                重量kg=original.重量kg, 金额=original.金额, 时间=_now(),
+                依据=f"恢复：{original.编号}", 关联编号=fund_entry_id,
+                操作人=actor.name)
+            self._recall_funds[eid] = entry
+            # 释放占用，允许后续重新暂缓
+            occupancy = self._fund_holds.get(original.结算编号, {})
+            left = occupancy.get(original.磅单编号, Decimal("0")) - original.重量kg
+            if left <= 0:
+                occupancy.pop(original.磅单编号, None)
+            else:
+                occupancy[original.磅单编号] = left
+            return self._fund_view(entry)
+
+    def confirm_result(self, actor: Actor, recall_id: str, affected: bool,
+                       opinion: str = "") -> dict:
+        """复核结论：确认受影响 / 未受影响。未受影响时自动恢复全部未对冲的暂缓与追回。"""
+        self._require_role(actor, {ROLE_REGULATOR}, "出具召回复核结论")
+        with self._lock:
+            recall = self._recalls.get(recall_id)
+            if recall is None:
+                raise NotFound("召回单")
+            self._require_recall_open(recall)
+            restored = []
+            if not affected:
+                recall.确认未受影响 = True
+                restored_ids = {e.关联编号 for e in self._recall_funds.values()}
+                for entry in list(self._recall_funds.values()):
+                    if entry.召回编号 == recall_id \
+                            and entry.类型 in {FUND_HOLD, FUND_CLAIM_BACK} \
+                            and entry.编号 not in restored_ids:
+                        rid = self._id("召回资金")
+                        rev = RecallFundEntry(
+                            编号=rid, 召回编号=recall_id, 类型=FUND_RESTORE,
+                            结算编号=entry.结算编号, 农户编号=entry.农户编号,
+                            磅单编号=entry.磅单编号,
+                            重量kg=entry.重量kg, 金额=entry.金额, 时间=_now(),
+                            依据=f"复核未受影响，恢复：{entry.编号}",
+                            关联编号=entry.编号, 操作人=actor.name)
+                        self._recall_funds[rid] = rev
+                        restored.append(rid)
+                for entry in self._recall_funds.values():
+                    if entry.召回编号 == recall_id and entry.关联编号:
+                        occupancy = self._fund_holds.get(entry.结算编号, {})
+                        left = occupancy.get(entry.磅单编号, Decimal("0")) - entry.重量kg
+                        if left <= 0:
+                            occupancy.pop(entry.磅单编号, None)
+                        else:
+                            occupancy[entry.磅单编号] = left
+            return {"召回编号": recall_id, "确认未受影响": not affected,
+                    "意见": opinion, "自动恢复笔数": len(restored),
+                    "恢复记录": restored}
+
+    # ------------------------------------------------------------------ 结案
+
+    def close_recall(self, actor: Actor, recall_id: str) -> dict:
+        """结案：同时交代数量守恒、未回执节点与每笔资金变化。"""
+        self._require_role(actor, {ROLE_REGULATOR}, "召回结案")
+        with self._lock:
+            recall = self._recalls.get(recall_id)
+            if recall is None:
+                raise NotFound("召回单")
+            self._require_recall_open(recall)
+
+            tasks = [t for t in self._recall_tasks.values()
+                     if t.召回编号 == recall_id]
+            active = [t for t in tasks if t.移出版本 is None]
+            pending_conflicts = [c.编号 for c in self._recall_conflicts.values()
+                                 if c.召回编号 == recall_id and c.状态 == "待授权"]
+            if pending_conflicts:
+                raise Conflict("conflicts_open",
+                               f"存在待授权复核的冲突：{pending_conflicts}")
+            # 人工隔离的货物缩范围不自动释放，结案前必须显式销毁/退回/替代/解除
+            manual_held = [
+                t.编号 for t in tasks
+                if t.人工隔离
+                and t.已处置kg + t.处置去向.get(ACTION_RELEASE, Decimal("0"))
+                < t.受控数量kg
+            ]
+            if manual_held:
+                raise Conflict(
+                    "manual_quarantine_open",
+                    f"仍有被人工隔离的货物未显式处置（缩小范围不会自动释放）：{manual_held}")
+
+            # 数量守恒：受控 = 销毁+退回+替代交付+解除（含系统移出解除）
+            balance = []
+            totals = {ACTION_DESTROY: Decimal("0"), ACTION_RETURN: Decimal("0"),
+                      ACTION_REPLACE: Decimal("0"), ACTION_RELEASE: Decimal("0"),
+                      "受控": Decimal("0")}
+            for t in tasks:
+                cols = {a: t.处置去向.get(a, Decimal("0")) for a in
+                        (ACTION_DESTROY, ACTION_RETURN, ACTION_REPLACE)}
+                released = t.处置去向.get(ACTION_RELEASE, Decimal("0")) + \
+                    t.处置去向.get("解除（系统移出）", Decimal("0"))
+                accounted = sum(cols.values(), Decimal("0")) + released
+                if t.移出版本 is None and accounted != t.受控数量kg:
+                    raise Conflict(
+                        "quantity_not_conserved",
+                        f"任务 {t.编号} 数量不守恒：受控 {t.受控数量kg}kg，"
+                        f"已交代 {accounted}kg")
+                row = {"任务编号": t.编号, "节点类型": t.节点类型,
+                       "节点编号": t.节点编号, "保管方": t.保管方,
+                       "受控kg": str(t.受控数量kg),
+                       ACTION_DESTROY + "kg": str(cols[ACTION_DESTROY]),
+                       ACTION_RETURN + "kg": str(cols[ACTION_RETURN]),
+                       ACTION_REPLACE + "kg": str(cols[ACTION_REPLACE]),
+                       ACTION_RELEASE + "kg": str(released),
+                       "在范围内": t.移出版本 is None}
+                balance.append(row)
+                if t.移出版本 is None:
+                    totals["受控"] += t.受控数量kg
+                    totals[ACTION_DESTROY] += cols[ACTION_DESTROY]
+                    totals[ACTION_RETURN] += cols[ACTION_RETURN]
+                    totals[ACTION_REPLACE] += cols[ACTION_REPLACE]
+                    totals[ACTION_RELEASE] += released
+
+            unresolved = [t.编号 for t in active if t.状态 != TASK_DONE]
+            if unresolved:
+                raise Conflict(
+                    "tasks_open",
+                    f"仍有任务未完成处置：{unresolved}，不能结案")
+
+            no_receipt = [
+                {"任务编号": t.编号, "节点类型": t.节点类型,
+                 "节点编号": t.节点编号, "保管方": t.保管方,
+                 "原因": "系统移出，未获保管方回执" if t.移出版本 is not None
+                         else "无回执即关闭"}
+                for t in tasks
+                if not t.保管方已回执
+            ]
+
+            funds = [self._fund_view(e) for e in self._recall_funds.values()
+                     if e.召回编号 == recall_id]
+            hold_sum = sum((Decimal(e["金额"]) for e in funds
+                            if e["类型"] == FUND_HOLD), Decimal("0"))
+            back_sum = sum((Decimal(e["金额"]) for e in funds
+                            if e["类型"] == FUND_CLAIM_BACK), Decimal("0"))
+            restore_sum = sum((Decimal(e["金额"]) for e in funds
+                               if e["类型"] == FUND_RESTORE), Decimal("0"))
+
+            report = {
+                "召回编号": recall_id,
+                "范围版本": recall.当前版本,
+                "数量守恒": {
+                    "受控合计kg": str(totals["受控"]),
+                    "销毁kg": str(totals[ACTION_DESTROY]),
+                    "退回kg": str(totals[ACTION_RETURN]),
+                    "替代交付kg": str(totals[ACTION_REPLACE]),
+                    "解除kg": str(totals[ACTION_RELEASE]),
+                    "差额kg": str(totals["受控"] - totals[ACTION_DESTROY]
+                                  - totals[ACTION_RETURN] - totals[ACTION_REPLACE]
+                                  - totals[ACTION_RELEASE]),
+                    "逐任务": balance,
+                },
+                "未回执节点": no_receipt,
+                "资金变化": {
+                    "暂缓": _money(hold_sum), "追回": _money(back_sum),
+                    "恢复": _money(restore_sum),
+                    "净影响": _money(-(hold_sum + back_sum - restore_sum)),
+                    "逐笔": funds,
+                },
+            }
+            recall.状态 = "已结案"
+            recall.结案时间 = _now()
+            recall.结案报告 = report
+            return report
+
+    # ------------------------------------------------------------------ 召回查询
+
+    def list_recalls(self, actor: Actor) -> list[dict]:
+        with self._lock:
+            if actor.role == ROLE_GUARD:
+                raise PermissionDenied("查看召回信息")
+            out = []
+            for recall in self._recalls.values():
+                if actor.role in {ROLE_REGULATOR, ROLE_COOP}:
+                    out.append(self._recall_view(recall, actor))
+                elif self._tasks_visible(actor, recall):
+                    out.append(self._recall_view(recall, actor))
+            return out
+
+    def get_recall(self, actor: Actor, recall_id: str) -> dict:
+        with self._lock:
+            recall = self._recalls.get(recall_id)
+            if recall is None:
+                raise NotFound("召回单")
+            if actor.role == ROLE_GUARD:
+                raise PermissionDenied("查看召回信息")
+            if actor.role not in {ROLE_REGULATOR, ROLE_COOP} \
+                    and not self._tasks_visible(actor, recall):
+                raise PermissionDenied("查看非本保管方的召回单")
+            return self._recall_view(recall, actor)
+
+    def list_my_tasks(self, actor: Actor) -> list[dict]:
+        """保管方履职视图：只看分派给自己的处置任务。"""
+        with self._lock:
+            if actor.role == ROLE_GUARD:
+                raise PermissionDenied("查看召回任务")
+            return [self._task_view(t) for t in self._recall_tasks.values()
+                    if self._task_visible(actor, t)]
+
+    def get_recall_task(self, actor: Actor, task_id: str) -> dict:
+        with self._lock:
+            task = self._recall_tasks.get(task_id)
+            if task is None:
+                raise NotFound("召回任务")
+            if actor.role == ROLE_GUARD:
+                raise PermissionDenied("查看召回任务")
+            if actor.role not in {ROLE_REGULATOR, ROLE_COOP} \
+                    and not self._task_visible(actor, task):
+                raise PermissionDenied("查看他人保管任务")
+            return self._task_view(task, include_receipts=True)
+
+    def _tasks_visible(self, actor: Actor, recall: Recall) -> bool:
+        return any(self._task_visible(actor, t) for t in self._recall_tasks.values()
+                   if t.召回编号 == recall.编号)
+
+    def _task_visible(self, actor: Actor, task: RecallTask) -> bool:
+        if actor.role == ROLE_FARMER:
+            return task.保管方角色 == ROLE_FARMER and actor.farmer_id == task.保管方
+        if actor.role in {ROLE_ENTERPRISE, ROLE_PROCESSOR}:
+            return actor.name == task.保管方
+        return False
+
+    # ------------------------------------------------------------------ 召回内部工具
+
+    def _load_recall_task(self, recall_id: str, task_id: str):
+        recall = self._recalls.get(recall_id)
+        if recall is None:
+            raise NotFound("召回单")
+        task = self._recall_tasks.get(task_id)
+        if task is None or task.召回编号 != recall_id:
+            raise NotFound("召回任务")
+        return recall, task
+
+    @staticmethod
+    def _require_recall_open(recall: Recall):
+        if recall.状态 == "已结案":
+            raise Conflict("recall_closed", "召回单已结案，不可再变更")
+
+    def _require_custodian(self, actor: Actor, task: RecallTask):
+        if actor.role in {ROLE_REGULATOR, ROLE_COOP}:
+            return  # 监管/合作社可代录纸质离线回执
+        if actor.role == ROLE_FARMER:
+            if task.保管方角色 == ROLE_FARMER and actor.farmer_id == task.保管方:
+                return
+        elif actor.name == task.保管方 and actor.role == task.保管方角色:
+            return
+        raise PermissionDenied("代非本保管方提交回执")
+
+    def _latest_receipt(self, recall_id: str, task_id: str) -> RecallReceipt:
+        matches = [r for r in self._recall_receipts.values()
+                   if r.召回编号 == recall_id and r.任务编号 == task_id]
+        return matches[-1]
+
+    def _ticket_under_active_recall(self, ticket_id: str) -> bool:
+        return any(
+            r.状态 != "已结案" and ticket_id in r.范围内节点
+            for r in self._recalls.values()
+        )
+
     # ------------------------------------------------------------------ 序列化视图
 
     def _plot_view(self, p: Plot) -> dict:
@@ -1159,3 +2269,90 @@ class HeritageCitrusService:
         return {"巡护编号": v.编号, "树群编号": v.树群编号, "地块编号": v.地块编号,
                 "类型": v.类型, "描述": v.描述, "上报人": v.上报人,
                 "时间": v.时间, "处理状态": v.处理状态}
+
+    # ------------------------------------------------------------------ 加工/召回视图
+
+    def _process_batch_view(self, p: ProcessingBatch) -> dict:
+        return {"加工批次编号": p.编号, "加工方": p.加工方, "时间": p.时间,
+                "制品": p.制品, "投入合计kg": str(p.投入合计kg),
+                "投入明细": [
+                    {"来源类型": ln["来源类型"], "来源单号": ln["来源单号"],
+                     "重量kg": str(ln["重量kg"])} for ln in p.投入明细]}
+
+    def _good_view(self, g: FinishedGood) -> dict:
+        return {"成品编号": g.编号, "加工批次编号": g.加工批次编号, "名称": g.名称,
+                "成品批次号": g.批次号, "重量kg": str(g.重量kg), "时间": g.时间,
+                "当前保管方": g.当前保管方, "地点": g.地点, "状态": g.状态}
+
+    def _task_view(self, t: RecallTask, include_receipts: bool = False) -> dict:
+        view = {
+            "任务编号": t.编号, "召回编号": t.召回编号,
+            "节点类型": t.节点类型, "节点编号": t.节点编号,
+            "保管方": t.保管方, "保管方角色": t.保管方角色,
+            "处置动作": t.动作, "受控数量kg": str(t.受控数量kg),
+            "状态": t.状态, "加入版本": t.加入版本, "移出版本": t.移出版本,
+            "人工隔离": t.人工隔离, "已处置kg": str(t.已处置kg),
+            "处置去向": {k: str(v) for k, v in t.处置去向.items()},
+            "保管方已回执": t.保管方已回执, "备注": t.备注,
+        }
+        if include_receipts:
+            view["回执"] = [
+                self._receipt_view(r) for r in self._recall_receipts.values()
+                if r.任务编号 == t.编号
+            ]
+        return view
+
+    def _notice_view(self, n: RecallNotice) -> dict:
+        return {"通知编号": n.编号, "召回编号": n.召回编号, "任务编号": n.任务编号,
+                "渠道": n.渠道, "时间": n.时间}
+
+    def _receipt_view(self, r: RecallReceipt) -> dict:
+        return {"回执编号": r.编号, "召回编号": r.召回编号, "任务编号": r.任务编号,
+                "回执号": r.回执号, "保管方": r.保管方, "动作": r.动作,
+                "数量kg": str(r.数量kg), "时间": r.时间, "离线": r.离线,
+                "首次通知编号": r.首次通知编号}
+
+    def _conflict_view(self, c: RecallConflict) -> dict:
+        return {"冲突编号": c.编号, "召回编号": c.召回编号, "任务编号": c.任务编号,
+                "保管方": c.保管方, "上报数量kg": str(c.上报数量kg),
+                "系统数量kg": str(c.系统数量kg), "原因": c.原因, "时间": c.时间,
+                "状态": c.状态, "授权人": c.授权人, "授权时间": c.授权时间,
+                "授权意见": c.授权意见,
+                "认定数量kg": str(c.认定数量kg) if c.认定数量kg is not None else None}
+
+    def _fund_view(self, e: RecallFundEntry) -> dict:
+        return {"资金编号": e.编号, "召回编号": e.召回编号, "类型": e.类型,
+                "结算编号": e.结算编号, "农户编号": e.农户编号,
+                "磅单编号": e.磅单编号, "重量kg": str(e.重量kg), "金额": e.金额,
+                "时间": e.时间, "依据": e.依据, "关联编号": e.关联编号,
+                "操作人": e.操作人}
+
+    def _version_view(self, v: RecallScopeVersion) -> dict:
+        return {"版本": v.版本, "时间": v.时间, "操作": v.操作,
+                "范围节点": v.节点, "说明": v.说明}
+
+    def _recall_view(self, r: Recall, actor: Actor | None = None) -> dict:
+        full = actor is not None and actor.role in {ROLE_REGULATOR, ROLE_COOP}
+        tasks = [t for t in self._recall_tasks.values() if t.召回编号 == r.编号]
+        view = {
+            "召回编号": r.编号,
+            "发起节点": {"类型": r.发起节点类型, "编号": r.发起节点编号},
+            "原因": r.原因, "检验依据编号": r.检验依据编号,
+            "发起人": r.发起人, "发起时间": r.发起时间,
+            "当前版本": r.当前版本, "状态": r.状态,
+            "版本历史": [self._version_view(v) for v in r.版本历史],
+            "任务": [self._task_view(t) for t in tasks
+                    if full or (actor is not None and self._task_visible(actor, t))],
+        }
+        if full:
+            view["范围内节点"] = sorted(r.范围内节点)
+            view["确认未受影响"] = r.确认未受影响
+            view["未决冲突"] = [
+                self._conflict_view(c) for c in self._recall_conflicts.values()
+                if c.召回编号 == r.编号 and c.状态 == "待授权"]
+            view["资金追加账"] = [
+                self._fund_view(e) for e in self._recall_funds.values()
+                if e.召回编号 == r.编号]
+            if r.结案报告:
+                view["结案报告"] = r.结案报告
+        return view

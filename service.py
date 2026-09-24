@@ -59,6 +59,58 @@ def make_handler(service: HeritageCitrusService):
         def _actor(self) -> Actor:
             return self.svc.authenticate(self.headers.get("X-Actor-Token"))
 
+        def _handle_recall_action(self, svc, actor, action_key, data):
+            """分发 /recalls/{id}/scope|notify|receipt|conflicts/{cid}/... 等子动作。"""
+            _, recall_id, sub = action_key
+            status, payload = 201, None
+            if sub == "scope":
+                payload = svc.rescope_recall(
+                    actor, recall_id, data["节点类型"], data["节点编号"],
+                    data.get("说明", ""))
+            elif sub == "notify":
+                payload = svc.notify_task(
+                    actor, recall_id, data["任务编号"],
+                    data["渠道"], data["内容"])
+            elif sub == "receipts":
+                payload = svc.submit_receipt(
+                    actor, recall_id, data["任务编号"], data["回执号"],
+                    data["动作"], data["数量kg"],
+                    offline=bool(data.get("断网离线", False)),
+                    manual=bool(data.get("人工隔离", False)),
+                    note=data.get("备注", ""))
+            elif sub == "release":
+                payload = svc.release_quarantine(
+                    actor, recall_id, data["任务编号"],
+                    data.get("数量kg"), data.get("备注", ""))
+            elif sub == "funds/hold":
+                payload = svc.hold_funds(
+                    actor, recall_id, data["结算编号"],
+                    data.get("重量kg"), data.get("依据", ""))
+            elif sub == "funds/claim-back":
+                payload = svc.claim_back_funds(
+                    actor, recall_id, data["结算编号"],
+                    data.get("重量kg"), data.get("依据", ""))
+            elif sub == "funds/restore":
+                payload = svc.restore_funds(
+                    actor, recall_id, data["资金编号"])
+            elif sub == "confirm":
+                status = 200
+                payload = svc.confirm_result(
+                    actor, recall_id, bool(data["受影响"]), data.get("意见", ""))
+            elif sub == "close":
+                status = 200
+                payload = svc.close_recall(actor, recall_id)
+            elif sub.startswith("conflicts/"):
+                conflict_id = sub.split("/", 1)[1]
+                payload = svc.resolve_conflict(
+                    actor, conflict_id, data["决定"],
+                    accepted_kg=data.get("认定数量kg"),
+                    opinion=data.get("授权意见", ""))
+            else:
+                self._send(404, {"error": "not_found", "message": "未知召回子操作"})
+                return
+            self._send(status, payload)
+
         def log_message(self, *_args):
             return
 
@@ -72,8 +124,10 @@ def make_handler(service: HeritageCitrusService):
                     self._send(200, health_payload())
                     return
                 known = (path == "/batches" or path == "/trace"
+                         or path == "/recalls" or path == "/recall-tasks"
                          or path.startswith(("/batches/", "/trees/",
-                                             "/settlements/", "/ledgers/")))
+                                             "/settlements/", "/ledgers/",
+                                             "/recalls/", "/recall-tasks/")))
                 if not known:
                     self._send(404, {"error": "not_found", "message": "未知路由"})
                     return
@@ -82,6 +136,15 @@ def make_handler(service: HeritageCitrusService):
 
                 if path == "/batches":
                     self._send(200, {"记录": self.svc.list_batches(actor)})
+                elif path == "/recalls":
+                    self._send(200, {"记录": self.svc.list_recalls(actor)})
+                elif path == "/recall-tasks":
+                    self._send(200, {"记录": self.svc.list_my_tasks(actor)})
+                elif path.startswith("/recall-tasks/"):
+                    self._send(200, self.svc.get_recall_task(
+                        actor, path.split("/")[2]))
+                elif path.startswith("/recalls/"):
+                    self._send(200, self.svc.get_recall(actor, path.split("/")[2]))
                 elif path.startswith("/batches/"):
                     self._send(200, self.svc.get_batch_detail(actor, path.split("/")[2]))
                 elif path.startswith("/trees/"):
@@ -121,8 +184,15 @@ def make_handler(service: HeritageCitrusService):
                     "/batches", "/reservations", "/weigh", "/inspections", "/reviews",
                     "/price-rules", "/contracts", "/deliveries", "/settlements",
                     "/returns", "/losses", "/processing", "/reports",
+                    "/processing-batches", "/goods", "/recalls",
                 }
-                if path not in known_post:
+                # 召回子动作走 /recalls/{id}/... 前缀
+                recall_action = None
+                if path.startswith("/recalls/") and path != "/recalls":
+                    parts = path.strip("/").split("/")
+                    if len(parts) >= 3:
+                        recall_action = (parts[0], parts[1], "/".join(parts[2:]))
+                if path not in known_post and recall_action is None:
                     self._send(404, {"error": "not_found", "message": "未知路由"})
                     return
 
@@ -197,6 +267,22 @@ def make_handler(service: HeritageCitrusService):
                 elif path == "/reports":
                     self._send(201, svc.report_tree_issue(
                         actor, data["树群编号"], data["类型"], data["描述"]))
+                elif path == "/processing-batches":
+                    self._send(201, svc.register_processing_batch(
+                        actor, data["制品"], data["投入明细"],
+                        at=data.get("时间")))
+                elif path == "/goods":
+                    self._send(201, svc.register_good(
+                        actor, data["加工批次编号"], data["名称"], data["成品批次号"],
+                        data["重量kg"], custodian=data.get("当前保管方", ""),
+                        location=data.get("地点", ""),
+                        status=data.get("状态", "在库"), at=data.get("时间")))
+                elif path == "/recalls":
+                    self._send(201, svc.initiate_recall(
+                        actor, data["节点类型"], data["节点编号"],
+                        data["原因"], data["检验依据编号"]))
+                elif recall_action is not None:
+                    self._handle_recall_action(svc, actor, recall_action, data)
                 else:
                     self._send(404, {"error": "not_found", "message": "未知路由"})
             except KeyError as exc:

@@ -15,6 +15,8 @@ from domain import (
     ROLE_GUARD,
     ROLE_REVIEWER,
     ROLE_ENTERPRISE,
+    ROLE_PROCESSOR,
+    ROLE_REGULATOR,
     ValidationFailed,
 )
 
@@ -28,11 +30,15 @@ class World:
         self.svc.register_actor("reviewer", "严复核", ROLE_REVIEWER)
         self.svc.register_actor("guard", "护树员老吴", ROLE_GUARD)
         self.svc.register_actor("ent", "广兴饮料厂", ROLE_ENTERPRISE)
+        self.svc.register_actor("proc", "陈皮加工厂", ROLE_PROCESSOR)
+        self.svc.register_actor("reg", "监管老冯", ROLE_REGULATOR)
 
         self.coop = self.svc.authenticate("coop")
         self.reviewer = self.svc.authenticate("reviewer")
         self.guard = self.svc.authenticate("guard")
         self.ent = self.svc.authenticate("ent")
+        self.proc = self.svc.authenticate("proc")
+        self.reg = self.svc.authenticate("reg")
 
         farmer = self.svc.register_farmer(self.coop, "梁果农")
         self.farmer_id = farmer["农户编号"]
@@ -570,6 +576,440 @@ class TraceabilityTest(unittest.TestCase):
         self.assertEqual(chain["加工入口"]["制品"], "陈皮")
         self.assertEqual(chain["交货单"]["交货单编号"], did)
         self.assertEqual(chain["地块"]["地块编号"], w.plot_id)
+
+
+class RecallTestBase(unittest.TestCase):
+    """召回测试公共夹具：一条完整的 过磅→检验→交货→结算 链，可选加工/成品。"""
+
+    def setUp(self):
+        self.w = World()
+
+    def delivered_chain(self, slip="R1", weight="100", grade="A",
+                        date="2026-09-02"):
+        w = self.w
+        batch = w.svc.open_batch(w.coop, w.plot_id, "2026-09-01", "2026秋")
+        ticket, insp = weigh_inspect_settle(
+            w, batch["批次编号"], w.old_tree_id, slip, weight, grade)
+        delivery = w.svc.deliver(
+            w.coop, batch["批次编号"], "广兴饮料厂", w.contract_id,
+            f"{date}T08:00:00+00:00")
+        settlement = w.svc.settle(w.coop, delivery["交货单编号"])
+        return {"批次": batch["批次编号"], "磅单": ticket["磅单编号"],
+                "检验": insp["检验编号"], "交货": delivery["交货单编号"],
+                "结算": settlement["结算编号"]}
+
+    def start_recall(self, chain, node_type="过磅批次", node_id_key="磅单",
+                     reason="复检农残超标"):
+        r = self.w.svc.initiate_recall(
+            self.w.reg, node_type, chain[node_id_key], reason, chain["检验"])
+        return r["召回编号"], r
+
+    def process_to_goods(self, delivery_id: str, input_kg="100",
+                         goods=("陈皮罐", "CP-1", "60"), custodian="陈皮加工厂",
+                         status="在库"):
+        w = self.w
+        pb = w.svc.register_processing_batch(
+            w.proc, "陈皮",
+            [{"来源类型": "交货", "来源单号": delivery_id, "重量kg": input_kg}])
+        name, batch_no, weight = goods
+        good = w.svc.register_good(
+            w.proc, pb["加工批次编号"], name, batch_no, weight,
+            custodian=custodian, status=status)
+        return pb, good
+
+    def dispose(self, rid, task, actor, receipt_no, action, qty, **kw):
+        w = self.w
+        w.svc.notify_task(w.reg, rid, task["任务编号"], "短信", "请按要求处置")
+        return w.svc.submit_receipt(
+            actor, rid, task["任务编号"], receipt_no, action, qty, **kw)
+
+
+class RecallInitiationTest(RecallTestBase):
+    def test_recall_from_any_node_traces_parent_child_quantities(self):
+        w = self.w
+        chain = self.delivered_chain()
+        # 已交货的磅单：保管方是企业，首选动作拦截
+        _, recall = self.start_recall(chain)
+        task = recall["任务"][0]
+        self.assertEqual(task["节点类型"], "过磅批次")
+        self.assertEqual(task["节点编号"], chain["磅单"])
+        self.assertEqual(task["受控数量kg"], "100")
+        self.assertEqual(task["保管方角色"], ROLE_ENTERPRISE)
+        self.assertEqual(task["处置动作"], "拦截")
+        self.assertEqual(recall["当前版本"], 1)
+        self.assertEqual(recall["版本历史"][0]["操作"], "建立")
+
+    def test_recall_from_plot_covers_all_batches(self):
+        w = self.w
+        c1 = self.delivered_chain("P1", "60")
+        c2 = self.delivered_chain("P2", "40", date="2026-09-06")
+        rid = w.svc.initiate_recall(
+            w.reg, "地块", w.plot_id, "地块级农残", c1["检验"])
+        node_ids = {t["节点编号"] for t in rid["任务"]}
+        self.assertEqual(node_ids, {c1["磅单"], c2["磅单"]})
+
+    def test_recall_from_finished_good_and_process_batch(self):
+        w = self.w
+        chain = self.delivered_chain()
+        pb, good = self.process_to_goods(chain["交货"], goods=("陈皮罐", "CP1", "60"))
+        # 从成品发起：只定位到成品，按成品数量受控，不与加工投入重复计数
+        rid = w.svc.initiate_recall(
+            w.reg, "成品", good["成品编号"], "成品检出农残", chain["检验"])
+        self.assertEqual(len(rid["任务"]), 1)
+        self.assertEqual(rid["任务"][0]["节点类型"], "成品")
+        self.assertEqual(rid["任务"][0]["受控数量kg"], "60")
+        # 从加工批次发起：成品 60 + 在制余量 40，同批货只计一次
+        rid2 = w.svc.initiate_recall(
+            w.reg, "加工批次", pb["加工批次编号"], "加工批农残", chain["检验"])
+        by_type = {t["节点类型"]: t for t in rid2["任务"]}
+        self.assertEqual(by_type["成品"]["受控数量kg"], "60")
+        self.assertEqual(by_type["加工批次"]["受控数量kg"], "40")
+
+    def test_in_storage_ticket_custodian_is_farmer_and_settlement_held(self):
+        w = self.w
+        batch = w.svc.open_batch(w.coop, w.plot_id, "2026-09-20", "2026秋")
+        ticket = w.svc.weigh(
+            w.coop, batch["批次编号"], w.old_tree_id, "H1", weight_kg="10")
+        insp = w.svc.inspect(w.reviewer, ticket["磅单编号"], "A", "达标")
+        rid = w.svc.initiate_recall(
+            w.reg, "过磅批次", ticket["磅单编号"], "农残", insp["检验编号"])
+        task = rid["任务"][0]
+        self.assertEqual(task["保管方角色"], ROLE_FARMER)
+        self.assertEqual(task["处置动作"], "隔离")
+        # 农户只能看到自己的处置任务
+        self.assertEqual(len(w.svc.list_my_tasks(w.farmer)), 1)
+        # 货仍在召回中：交货后结算被闸门拦截
+        delivery = w.svc.deliver(
+            w.coop, batch["批次编号"], "广兴饮料厂", w.contract_id,
+            "2026-09-21T08:00:00+00:00")
+        with self.assertRaises(Conflict) as cm:
+            w.svc.settle(w.coop, delivery["交货单编号"])
+        self.assertEqual(cm.exception.code, "recall_hold")
+
+
+class RecallScopeVersionTest(RecallTestBase):
+    def test_expand_adds_tasks_and_shrink_keeps_manual_quarantine(self):
+        w = self.w
+        c1 = self.delivered_chain("P1", "60")
+        c2 = self.delivered_chain("P2", "40", date="2026-09-06")
+        rid, _ = self.start_recall(c1)
+        task1 = self.task_of(rid, c1["磅单"])
+
+        # 扩大到地块：补建 c2 任务，版本升 v2
+        v2 = w.svc.rescope_recall(w.reg, rid, "地块", w.plot_id, "扩大排查")
+        self.assertEqual(v2["当前版本"], 2)
+        self.assertEqual(v2["版本历史"][-1]["操作"], "扩大")
+        task2 = self.task_of(rid, c2["磅单"])
+        self.assertEqual(task2["加入版本"], 2)
+
+        # c1 被人工隔离 60kg
+        self.dispose(rid, task1, w.ent, "RC1", "隔离", "60", manual=True)
+        self.assertTrue(self.task_of(rid, c1["磅单"])["人工隔离"])
+
+        # 缩小回 c1：c2 未被触碰，系统移出且不算保管方回执；c1 人工隔离保留
+        v3 = w.svc.rescope_recall(w.reg, rid, "过磅批次", c1["磅单"], "排除c2")
+        self.assertEqual(v3["版本历史"][-1]["操作"], "缩小")
+        t2_after = self.task_of(rid, c2["磅单"])
+        self.assertEqual(t2_after["状态"], "已处置")
+        self.assertFalse(t2_after["保管方已回执"])
+        self.assertIn("系统移出", str(t2_after["处置去向"]))
+        t1_after = self.task_of(rid, c1["磅单"])
+        self.assertTrue(t1_after["人工隔离"])
+        self.assertNotEqual(t1_after["状态"], "已处置")
+
+        # 未显式处置人工隔离货物前不得结案（缩范围不自动释放）
+        with self.assertRaises(Conflict) as cm:
+            w.svc.close_recall(w.reg, rid)
+        self.assertEqual(cm.exception.code, "manual_quarantine_open")
+
+    def test_identical_scope_does_not_create_version(self):
+        w = self.w
+        chain = self.delivered_chain()
+        rid, _ = self.start_recall(chain)
+        with self.assertRaises(Conflict) as cm:
+            w.svc.rescope_recall(w.reg, rid, "过磅批次", chain["磅单"])
+        self.assertEqual(cm.exception.code, "scope_unchanged")
+
+    def test_rescope_resyncs_untouched_task_when_goods_moved(self):
+        """召回发起后果实转入加工：扩范围重算时，未触碰的磅单任务受控量同步下调，
+        已加工的量补建到成品节点，同批货不重复计数。"""
+        w = self.w
+        chain = self.delivered_chain(weight="100")
+        rid, _ = self.start_recall(chain)
+        self.assertEqual(self.task_of(rid, chain["磅单"])["受控数量kg"], "100")
+        # 60kg 交货果被加工为成品
+        _, good = self.process_to_goods(
+            chain["交货"], input_kg="60", goods=("陈皮罐", "CP1", "60"))
+        # 扩大到地块（本地块仅此一个磅单）：磅单余量下调、成品补建
+        v2 = w.svc.rescope_recall(w.reg, rid, "地块", w.plot_id, "货权移动后重算")
+        self.assertEqual(v2["版本历史"][-1]["操作"], "扩大")
+        self.assertEqual(self.task_of(rid, chain["磅单"])["受控数量kg"], "40")
+        goods_task = next(t for t in v2["任务"] if t["节点类型"] == "成品")
+        self.assertEqual(goods_task["受控数量kg"], "60")
+
+    def task_of(self, rid, node_id):
+        return next(t for t in self.w.svc.get_recall(self.w.reg, rid)["任务"]
+                    if t["节点编号"] == node_id)
+
+
+class RecallIdempotencyTest(RecallTestBase):
+    def test_offline_receipt_replay_applies_once(self):
+        w = self.w
+        chain = self.delivered_chain()
+        rid, recall = self.start_recall(chain)
+        task = recall["任务"][0]
+        w.svc.notify_task(w.reg, rid, task["任务编号"], "短信", "销毁全部")
+        first = w.svc.submit_receipt(
+            w.ent, rid, task["任务编号"], "PAPER-9",
+            "销毁", "100", offline=True)
+        self.assertFalse(first["重复"])
+        # 网络恢复后离线凭证重传：只返回原回执，不重复处置
+        replay = w.svc.submit_receipt(
+            w.ent, rid, task["任务编号"], "PAPER-9",
+            "销毁", "100", offline=True)
+        self.assertTrue(replay["重复"])
+        self.assertEqual(replay["回执"]["回执编号"], first["回执"]["回执编号"])
+        stored = w.svc.get_recall_task(w.reg, task["任务编号"])
+        self.assertEqual(stored["处置去向"]["销毁"], "100")
+        self.assertEqual(len(stored["回执"]), 1)
+
+    def test_duplicate_notification_has_no_effect(self):
+        w = self.w
+        chain = self.delivered_chain()
+        rid, recall = self.start_recall(chain)
+        task = recall["任务"][0]
+        n1 = w.svc.notify_task(w.reg, rid, task["任务编号"], "短信", "同内容")
+        n2 = w.svc.notify_task(w.reg, rid, task["任务编号"], "短信", "同内容")
+        n3 = w.svc.notify_task(w.reg, rid, task["任务编号"], "短信", "内容更新")
+        self.assertFalse(n1["重复"])
+        self.assertTrue(n2["重复"])
+        self.assertFalse(n3["重复"])
+        notices = [n for n in w.svc._recall_notices.values()
+                   if n.任务编号 == task["任务编号"]]
+        self.assertEqual(len(notices), 2)
+
+    def test_non_custodian_cannot_receipt(self):
+        w = self.w
+        chain = self.delivered_chain()
+        rid, recall = self.start_recall(chain)
+        task = recall["任务"][0]
+        with self.assertRaises(PermissionDenied):
+            w.svc.submit_receipt(w.farmer, rid, task["任务编号"], "X", "销毁", "1")
+        with self.assertRaises(PermissionDenied):
+            w.svc.submit_receipt(w.proc, rid, task["任务编号"], "X", "销毁", "1")
+
+
+class RecallConflictTest(RecallTestBase):
+    def test_quantity_conflict_waits_for_regulator_authorization(self):
+        w = self.w
+        chain = self.delivered_chain()
+        rid, recall = self.start_recall(chain)
+        task = recall["任务"][0]
+        w.svc.notify_task(w.reg, rid, task["任务编号"], "短信", "隔离")
+        result = w.svc.submit_receipt(
+            w.ent, rid, task["任务编号"], "X1", "销毁", "120")
+        conflict = result["冲突"]
+        self.assertEqual(conflict["上报数量kg"], "120")
+        self.assertEqual(conflict["系统数量kg"], "100")
+        self.assertEqual(conflict["状态"], "待授权")
+        self.assertEqual(self.task(rid, task["任务编号"])["状态"], "冲突待复核")
+
+        # 企业无权授权
+        with self.assertRaises(PermissionDenied):
+            w.svc.resolve_conflict(w.ent, conflict["冲突编号"], "调整", "120")
+        # 监管维持系统数量后，按 100kg 重新回执即可处置
+        w.svc.resolve_conflict(w.reg, conflict["冲突编号"], "维持",
+                               opinion="以受控量为准")
+        again = w.svc.submit_receipt(
+            w.ent, rid, task["任务编号"], "X2", "销毁", "100")
+        self.assertIsNone(again["冲突"])
+        report = w.svc.close_recall(w.reg, rid)
+        self.assertEqual(report["数量守恒"]["差额kg"], "0")
+
+    def test_authorized_adjustment_is_audited(self):
+        w = self.w
+        chain = self.delivered_chain()
+        rid, recall = self.start_recall(chain)
+        task = recall["任务"][0]
+        w.svc.notify_task(w.reg, rid, task["任务编号"], "短信", "隔离")
+        conflict = w.svc.submit_receipt(
+            w.ent, rid, task["任务编号"], "X1", "隔离", "120")["冲突"]
+        w.svc.resolve_conflict(w.reg, conflict["冲突编号"], "调整", "100",
+                               opinion="现场清点以100kg登记")
+        view = w.svc.get_recall(w.reg, rid)
+        self.assertEqual(view["未决冲突"], [])
+        done = self.task(rid, task["任务编号"])
+        self.assertEqual(done["处置去向"]["隔离"], "100")
+
+    def task(self, rid, task_id):
+        return self.w.svc.get_recall_task(self.w.reg, task_id)
+
+
+class RecallFundsAndImmutabilityTest(RecallTestBase):
+    def test_hold_claim_back_restore_are_appended_only(self):
+        w = self.w
+        chain = self.delivered_chain(weight="100", grade="A")
+        rid, _ = self.start_recall(chain)
+        task = self.w.svc.get_recall(w.reg, rid)["任务"][0]
+        self.dispose(rid, task, w.ent, "R1", "销毁", "100")
+        # 暂缓：追加账，金额按结算固化单价 4 元/kg
+        hold = w.svc.hold_funds(w.reg, rid, chain["结算"], basis="农残确认")
+        self.assertEqual(hold["合计重量kg"], "100")
+        self.assertEqual(hold["合计金额"], "400.00")
+        # 历史结算行原样
+        self.assertEqual(
+            w.svc.get_settlement(w.coop, chain["结算"])
+            ["明细行"][-1]["合计应收"], "400.00")
+        # 同一磅单不能重复暂缓
+        with self.assertRaises(Conflict) as cm:
+            w.svc.hold_funds(w.reg, rid, chain["结算"])
+        self.assertEqual(cm.exception.code, "funds_already_covered")
+        # 先恢复暂缓，再对其中 30kg 追回、再恢复
+        hold_id = hold["明细"][0]["资金编号"]
+        w.svc.restore_funds(w.reg, rid, hold_id)
+        claim = w.svc.claim_back_funds(
+            w.reg, rid, chain["结算"], weight_kg="30", basis="已付款部分追回")
+        self.assertEqual(claim["合计金额"], "120.00")
+        w.svc.restore_funds(w.reg, rid, claim["明细"][0]["资金编号"])
+        with self.assertRaises(Conflict):
+            w.svc.restore_funds(w.reg, rid, claim["明细"][0]["资金编号"])
+        report = w.svc.close_recall(w.reg, rid)
+        self.assertEqual(report["资金变化"]["暂缓"], "400.00")
+        self.assertEqual(report["资金变化"]["追回"], "120.00")
+        self.assertEqual(report["资金变化"]["恢复"], "520.00")
+        self.assertEqual(report["资金变化"]["净影响"], "0.00")
+
+    def test_funds_from_goods_recall_prorate_back_to_tickets(self):
+        w = self.w
+        chain = self.delivered_chain(weight="100")
+        _, good = self.process_to_goods(chain["交货"], goods=("陈皮罐", "CP1", "50"))
+        rid = w.svc.initiate_recall(
+            w.reg, "成品", good["成品编号"], "成品农残", chain["检验"])["召回编号"]
+        task = w.svc.get_recall(w.reg, rid)["任务"][0]
+        self.dispose(rid, task, w.proc, "G1", "销毁", "50")
+        hold = w.svc.hold_funds(w.reg, rid, chain["结算"])
+        # 成品 50kg 沿父子数量关系摊回唯一磅单：暂缓 50kg × 4 元
+        self.assertEqual(hold["合计重量kg"], "50")
+        self.assertEqual(hold["合计金额"], "200.00")
+
+    def test_review_grade_during_recall_keeps_separate_adjustment_stream(self):
+        w = self.w
+        chain = self.delivered_chain(weight="100", grade="A")
+        rid, _ = self.start_recall(chain)
+        task = w.svc.get_recall(w.reg, rid)["任务"][0]
+        self.dispose(rid, task, w.ent, "R1", "销毁", "100")
+        # 召回不阻挡复核：等级申诉仍走价差调整，与召回资金追加账各自独立
+        result = w.svc.review_grade(
+            w.reviewer, chain["检验"], "B", "农残事件伴随降级")
+        self.assertEqual(result["价差调整"]["差额"], "-100.00")
+        hold = w.svc.hold_funds(w.reg, rid, chain["结算"])
+        self.assertEqual(hold["合计金额"], "400.00")
+        settlement = w.svc.get_settlement(w.coop, chain["结算"])
+        self.assertEqual(settlement["明细行"][-1]["合计应收"], "400.00")
+
+    def test_confirm_unaffected_auto_restores_funds(self):
+        w = self.w
+        chain = self.delivered_chain()
+        rid, _ = self.start_recall(chain)
+        task = w.svc.get_recall(w.reg, rid)["任务"][0]
+        self.dispose(rid, task, w.ent, "R1", "解除", "100")
+        w.svc.hold_funds(w.reg, rid, chain["结算"])
+        result = w.svc.confirm_result(w.reg, rid, False, "实验室复检合格")
+        self.assertEqual(result["自动恢复笔数"], 1)
+        report = w.svc.close_recall(w.reg, rid)
+        self.assertEqual(report["资金变化"]["净影响"], "0.00")
+
+
+class RecallClosureTest(RecallTestBase):
+    def test_close_requires_conservation_and_lists_missing_receipts(self):
+        w = self.w
+        c1 = self.delivered_chain("P1", "60")
+        c2 = self.delivered_chain("P2", "40", date="2026-09-06")
+        rid, _ = self.start_recall(c1)
+        task1 = self.w.svc.get_recall(w.reg, rid)["任务"][0]
+        # 扩大后不通知 c2 即缩小，制造“系统移出、未回执”节点
+        w.svc.rescope_recall(w.reg, rid, "地块", w.plot_id, "扩大")
+        task2 = next(t for t in w.svc.get_recall(w.reg, rid)["任务"]
+                     if t["节点编号"] == c2["磅单"])
+        w.svc.rescope_recall(w.reg, rid, "过磅批次", c1["磅单"], "排除c2")
+        # 只销毁 40（退回尚未回执）：数量未交代完，不能结案
+        self.dispose(rid, task1, w.ent, "R1", "销毁", "40")
+        with self.assertRaises(Conflict) as cm:
+            w.svc.close_recall(w.reg, rid)
+        self.assertEqual(cm.exception.code, "quantity_not_conserved")
+        # 补齐退回 20 后守恒
+        w.svc.submit_receipt(w.ent, rid, task1["任务编号"], "R2", "退回", "20")
+        report = w.svc.close_recall(w.reg, rid)
+        self.assertEqual(report["数量守恒"]["受控合计kg"], "60")
+        self.assertEqual(report["数量守恒"]["销毁kg"], "40")
+        self.assertEqual(report["数量守恒"]["退回kg"], "20")
+        self.assertEqual(report["数量守恒"]["差额kg"], "0")
+        missing = report["未回执节点"]
+        self.assertEqual(len(missing), 1)
+        self.assertEqual(missing[0]["节点编号"], c2["磅单"])
+
+    def test_replace_delivery_marks_good_and_conserves(self):
+        w = self.w
+        chain = self.delivered_chain()
+        _, good = self.process_to_goods(
+            chain["交货"], goods=("陈皮罐", "CP1", "60"),
+            custodian="广兴饮料厂", status="在途")
+        rid = w.svc.initiate_recall(
+            w.reg, "成品", good["成品编号"], "在途成品农残", chain["检验"])["召回编号"]
+        task = w.svc.get_recall(w.reg, rid)["任务"][0]
+        self.assertEqual(task["处置动作"], "拦截")
+        self.dispose(rid, task, w.ent, "T1", "拦截", "60", offline=True)
+        w.svc.submit_receipt(w.ent, rid, task["任务编号"], "T2", "替代交付", "60")
+        report = w.svc.close_recall(w.reg, rid)
+        self.assertEqual(report["数量守恒"]["替代交付kg"], "60")
+        self.assertEqual(w.svc._goods[good["成品编号"]].状态, "已替代")
+
+    def test_closed_recall_is_immutable(self):
+        w = self.w
+        chain = self.delivered_chain()
+        rid, recall = self.start_recall(chain)
+        task = recall["任务"][0]
+        self.dispose(rid, task, w.ent, "R1", "销毁", "100")
+        w.svc.close_recall(w.reg, rid)
+        with self.assertRaises(Conflict) as cm:
+            w.svc.notify_task(w.reg, rid, task["任务编号"], "短信", "再通知")
+        self.assertEqual(cm.exception.code, "recall_closed")
+        with self.assertRaises(Conflict):
+            w.svc.submit_receipt(w.ent, rid, task["任务编号"], "R9", "销毁", "1")
+
+
+class RecallRoleVisibilityTest(RecallTestBase):
+    def test_each_role_sees_only_duty_data(self):
+        w = self.w
+        chain = self.delivered_chain()
+        rid, _ = self.start_recall(chain)
+        task = w.svc.get_recall(w.reg, rid)["任务"][0]
+        self.dispose(rid, task, w.ent, "R1", "销毁", "100")
+        w.svc.hold_funds(w.reg, rid, chain["结算"])
+
+        # 监管看全貌：资金账、版本、范围节点
+        reg_view = w.svc.get_recall(w.reg, rid)
+        self.assertIn("资金追加账", reg_view)
+        self.assertIn("范围内节点", reg_view)
+        # 企业只看自己的任务，看不到资金账
+        ent_view = w.svc.get_recall(w.ent, rid)
+        self.assertEqual(len(ent_view["任务"]), 1)
+        self.assertNotIn("资金追加账", ent_view)
+        self.assertNotIn("范围内节点", ent_view)
+        # 护树队一概不可见
+        with self.assertRaises(PermissionDenied):
+            w.svc.get_recall(w.guard, rid)
+        with self.assertRaises(PermissionDenied):
+            w.svc.list_recalls(w.guard)
+        with self.assertRaises(PermissionDenied):
+            w.svc.initiate_recall(w.guard, "过磅批次", chain["磅单"], "x", chain["检验"])
+        # 加工方与该召回无关 → 看不到
+        self.assertEqual(w.svc.list_my_tasks(w.proc), [])
+        with self.assertRaises(PermissionDenied):
+            w.svc.get_recall(w.proc, rid)
+        # 无相关任务的农户看不到该召回
+        with self.assertRaises(PermissionDenied):
+            w.svc.get_recall(w.farmer, rid)
 
 
 if __name__ == "__main__":
